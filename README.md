@@ -1,2 +1,2 @@
 # Coming Soon rustfn
-<img width="1754" height="835" alt="image" src="https://github.com/user-attachments/assets/33c45c63-77a7-46c7-b932-88e96a536489" />
+<img width="1705" height="1023" alt="image" src="https://github.com/user-attachments/assets/1b05a6ca-dcfc-4e45-8af6-1e0b8b34f117" />

@@ -1,26 +1,26 @@
 # rustfn
 
-<img width="1754" height="835" alt="image" src="https://github.com/user-attachments/assets/33c45c63-77a7-46c7-b932-88e96a536489" />
+Async Rust client for Epic Online Services and Fortnite.
 
-Async Rust client SDK and social/party manager for Epic Online Services and Fortnite.
+## Features
 
-This project is experimental. Its automated tests use local service mocks; login, chat, and party behavior still need verification against live Epic services.
+- Device code sign-in and saved DeviceAuth credentials.
+- Friends, direct messages, and presence.
+- Parties, invitations, party chat, and bot commands.
 
-API naming and behavior follow [fnbr.js](https://github.com/fnbrjs/fnbr.js), which is available under the MIT license.
+## Installation
 
-## Modules
+Requires Rust 1.88 or newer. Add `rustfn` and Tokio to your `Cargo.toml`:
 
-The `rustfn` package contains `protocol`, `http`, `auth`, `xmpp`, `stomp`, `users`, `friends`, `chat`, `party`, `events`, `client`, and `commands`. They are modules of one crate and are available through `rustfn::`.
-
-## Examples
-
-Single bot ([example/basic.rs](example/basic.rs)):
-
-```powershell
-cargo run --example basic
+```toml
+[dependencies]
+rustfn = "0.1.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-On first launch without saved credentials under `./device_auth/*.json`, `basic` opens Epic's device authorization prompt in your browser, stores the generated `DeviceAuth` credentials to `./device_auth/<account_id>.json`, accepts incoming friend requests, and registers `!hello` and `!ping`.
+## Basic usage
+
+Save this as `src/main.rs`:
 
 ```rust
 use rustfn::commands::Bot;
@@ -29,16 +29,12 @@ use rustfn::commands::Bot;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Bot::new("!")
         .on_ready(|bot| async move {
-            println!("Bot ready as {} ({})", bot.user.display_name, bot.user.id);
+            println!("Bot ready as {}", bot.user.display_name);
         })
-        .on_friend_request(|req| async move {
-            if req.is_inbound() {
-                req.accept().await?;
+        .on_friend_request(|request| async move {
+            if request.is_inbound() {
+                request.accept().await?;
             }
-            Ok(())
-        })
-        .on_message(|ctx| async move {
-            println!("Message from {}: {}", ctx.author_name(), ctx.message.content);
             Ok(())
         })
         .command("hello", |ctx| async move { ctx.send("Hello!").await })
@@ -48,12 +44,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
 ```
 
-## Checks
+Run `cargo run`. On first run, complete Epic's device authorization. The bot saves generated DeviceAuth credentials under `./device_auth/` for later runs; keep that directory private. Send `!hello` or `!ping` to try the commands.
 
-```powershell
-cargo check --all-targets
-cargo test --all-targets
-```
+## Inspired by
+
+- [rebootpy](https://github.com/xMistt/rebootpy)
+- [fnbr.js](https://github.com/fnbrjs/fnbr.js)
+
+## License
+
+MIT.

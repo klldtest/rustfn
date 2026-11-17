@@ -1,0 +1,28 @@
+[package]
+name = "rustfn-party"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Dual EOS v2 and Fortnite v1 party state machine, member controls, metadata codecs, and squad assignment for rustfn"
+
+[dependencies]
+chrono.workspace = true
+rand_core.workspace = true
+rustfn-chat.workspace = true
+rustfn-friends.workspace = true
+rustfn-http.workspace = true
+rustfn-protocol.workspace = true
+rustfn-stomp.workspace = true
+rustfn-users.workspace = true
+rustfn-xmpp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+secrecy.workspace = true
+wiremock.workspace = true

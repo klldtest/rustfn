@@ -1,0 +1,23 @@
+[package]
+name = "rustfn-xmpp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RFC 7395 XMPP-over-WebSocket transport, stanza parser, keep-alive guard, and 10s metadata store for rustfn"
+
+[dependencies]
+rustfn-protocol.workspace = true
+rustfn-http.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+quick-xml.workspace = true
+base64.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dashmap.workspace = true
+secrecy.workspace = true
+tracing.workspace = true

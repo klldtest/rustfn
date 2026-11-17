@@ -1,0 +1,7 @@
+/target/
+/device_auth/
+.env
+*.pdb
+*.rs.bk
+.DS_Store
+.cargo

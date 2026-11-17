@@ -1,0 +1,15 @@
+[package]
+name = "rustfn-users"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TTL-bounded concurrent user profile cache and account lookup manager for rustfn"
+
+[dependencies]
+dashmap.workspace = true
+rustfn-http.workspace = true
+rustfn-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

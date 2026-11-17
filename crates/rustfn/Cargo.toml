@@ -1,0 +1,28 @@
+[package]
+name = "rustfn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Async Rust client SDK and party/social manager for Epic Online Services and Fortnite"
+
+[[example]]
+name = "basic"
+path = "../../example/basic.rs"
+
+[dependencies]
+rustfn-protocol.workspace = true
+rustfn-http.workspace = true
+rustfn-auth.workspace = true
+rustfn-xmpp.workspace = true
+rustfn-stomp.workspace = true
+rustfn-users.workspace = true
+rustfn-friends.workspace = true
+rustfn-chat.workspace = true
+rustfn-party.workspace = true
+rustfn-events.workspace = true
+rustfn-client.workspace = true
+rustfn-commands.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

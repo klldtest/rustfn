@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/http",
+    "crates/auth",
+    "crates/xmpp",
+    "crates/stomp",
+    "crates/users",
+    "crates/friends",
+    "crates/chat",
+    "crates/party",
+    "crates/events",
+    "crates/client",
+    "crates/commands",
+    "crates/rustfn",
+]
+default-members = ["crates/rustfn"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+rustfn = { version = "0.1.0", path = "crates/rustfn" }
+rustfn-protocol = { version = "0.1.0", path = "crates/protocol" }
+rustfn-http = { version = "0.1.0", path = "crates/http" }
+rustfn-auth = { version = "0.1.0", path = "crates/auth" }
+rustfn-xmpp = { version = "0.1.0", path = "crates/xmpp" }
+rustfn-stomp = { version = "0.1.0", path = "crates/stomp" }
+rustfn-users = { version = "0.1.0", path = "crates/users" }
+rustfn-friends = { version = "0.1.0", path = "crates/friends" }
+rustfn-chat = { version = "0.1.0", path = "crates/chat" }
+rustfn-party = { version = "0.1.0", path = "crates/party" }
+rustfn-events = { version = "0.1.0", path = "crates/events" }
+rustfn-client = { version = "0.1.0", path = "crates/client" }
+rustfn-commands = { version = "0.1.0", path = "crates/commands" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "deflate", "http2"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+quick-xml = "0.37"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = { version = "2", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "serde"] }
+secrecy = { version = "0.10", features = ["serde"] }
+zeroize = { version = "1", features = ["derive"] }
+
+dashmap = "6"
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+
+wiremock = "0.6"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1

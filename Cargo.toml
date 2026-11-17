@@ -1,0 +1,75 @@
+[package]
+name = "rustfn"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Async Rust client SDK and party/social manager for Epic Online Services and Fortnite"
+readme = "README.md"
+
+[[example]]
+name = "basic"
+path = "example/basic.rs"
+
+[workspace]
+resolver = "2"
+
+[workspace.dependencies]
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "deflate", "http2"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+quick-xml = "0.37"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = { version = "2", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "serde"] }
+secrecy = { version = "0.10", features = ["serde"] }
+zeroize = { version = "1", features = ["derive"] }
+
+dashmap = "6"
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+
+wiremock = "0.6"
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+ed25519-dalek.workspace = true
+futures-util.workspace = true
+quick-xml.workspace = true
+rand_core.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1

@@ -4,16 +4,12 @@ use rustfn::commands::Bot;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Bot::new("!")
         .on_ready(|bot| async move {
-            println!("Bot ready as {} ({})", bot.user.display_name, bot.user.id);
+            println!("Bot ready as {}", bot.user.display_name);
         })
-        .on_friend_request(|req| async move {
-            if req.is_inbound() {
-                req.accept().await?;
+        .on_friend_request(|request| async move {
+            if request.is_inbound() {
+                request.accept().await?;
             }
-            Ok(())
-        })
-        .on_message(|ctx| async move {
-            println!("Message from {}: {}", ctx.author_name(), ctx.message.content);
             Ok(())
         })
         .command("hello", |ctx| async move { ctx.send("Hello!").await })

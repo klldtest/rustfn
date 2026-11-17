@@ -1,42 +1,20 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/protocol",
-    "crates/http",
-    "crates/auth",
-    "crates/xmpp",
-    "crates/stomp",
-    "crates/users",
-    "crates/friends",
-    "crates/chat",
-    "crates/party",
-    "crates/events",
-    "crates/client",
-    "crates/commands",
-    "crates/rustfn",
-]
-default-members = ["crates/rustfn"]
-
-[workspace.package]
+[package]
+name = "rustfn"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
+description = "Async Rust client SDK and party/social manager for Epic Online Services and Fortnite"
+readme = "README.md"
+
+[[example]]
+name = "basic"
+path = "example/basic.rs"
+
+[workspace]
+resolver = "2"
 
 [workspace.dependencies]
-rustfn = { version = "0.1.0", path = "crates/rustfn" }
-rustfn-protocol = { version = "0.1.0", path = "crates/protocol" }
-rustfn-http = { version = "0.1.0", path = "crates/http" }
-rustfn-auth = { version = "0.1.0", path = "crates/auth" }
-rustfn-xmpp = { version = "0.1.0", path = "crates/xmpp" }
-rustfn-stomp = { version = "0.1.0", path = "crates/stomp" }
-rustfn-users = { version = "0.1.0", path = "crates/users" }
-rustfn-friends = { version = "0.1.0", path = "crates/friends" }
-rustfn-chat = { version = "0.1.0", path = "crates/chat" }
-rustfn-party = { version = "0.1.0", path = "crates/party" }
-rustfn-events = { version = "0.1.0", path = "crates/events" }
-rustfn-client = { version = "0.1.0", path = "crates/client" }
-rustfn-commands = { version = "0.1.0", path = "crates/commands" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
@@ -63,6 +41,31 @@ thiserror = "2"
 tracing = "0.1"
 
 wiremock = "0.6"
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+ed25519-dalek.workspace = true
+futures-util.workspace = true
+quick-xml.workspace = true
+rand_core.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
 
 [profile.dev]
 debug = "line-tables-only"

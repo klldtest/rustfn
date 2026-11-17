@@ -8,30 +8,16 @@ This project is experimental. Its automated tests use local service mocks; login
 
 API naming and behavior follow [fnbr.js](https://github.com/fnbrjs/fnbr.js), which is available under the MIT license.
 
-## Workspace
+## Modules
 
-| Crate | Package | Modules |
-| --- | --- | --- |
-| `crates/rustfn` | `rustfn` | Re-exports all workspace crates |
-| `crates/protocol` | `rustfn-protocol` | `endpoints`, `enums`, `error`, `meta` |
-| `crates/http` | `rustfn-http` | `http`, `fortnite`, `rate_limiter` |
-| `crates/auth` | `rustfn-auth` | `auth`, `fortnite`, `session` |
-| `crates/xmpp` | `rustfn-xmpp` | `xmpp`, `message`, `metadata_store` |
-| `crates/stomp` | `rustfn-stomp` | `stomp`, `message` |
-| `crates/users` | `rustfn-users` | `users` |
-| `crates/friends` | `rustfn-friends` | `friends` |
-| `crates/chat` | `rustfn-chat` | `chat` |
-| `crates/party` | `rustfn-party` | `client_party`, `party_member`, `party_meta`, `party_member_meta` |
-| `crates/events` | `rustfn-events` | `events` |
-| `crates/client` | `rustfn-client` | `client`, `config` |
-| `crates/commands` | `rustfn-commands` | `bot`, `cog`, `command`, `context`, `cooldown`, `error`, `help`, `view` |
+The `rustfn` package contains `protocol`, `http`, `auth`, `xmpp`, `stomp`, `users`, `friends`, `chat`, `party`, `events`, `client`, and `commands`. They are modules of one crate and are available through `rustfn::`.
 
 ## Examples
 
 Single bot ([example/basic.rs](example/basic.rs)):
 
 ```powershell
-cargo run -p rustfn --example basic
+cargo run --example basic
 ```
 
 On first launch without saved credentials under `./device_auth/*.json`, `basic` opens Epic's device authorization prompt in your browser, stores the generated `DeviceAuth` credentials to `./device_auth/<account_id>.json`, accepts incoming friend requests, and registers `!hello` and `!ping`.
@@ -68,6 +54,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Checks
 
 ```powershell
-cargo check --workspace --examples --tests
-cargo test --workspace --lib --tests
+cargo check --all-targets
+cargo test --all-targets
 ```

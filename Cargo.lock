@@ -1252,241 +1252,27 @@ dependencies = [
 name = "rustfn"
 version = "0.1.0"
 dependencies = [
- "rustfn-auth",
- "rustfn-chat",
- "rustfn-client",
- "rustfn-commands",
- "rustfn-events",
- "rustfn-friends",
- "rustfn-http",
- "rustfn-party",
- "rustfn-protocol",
- "rustfn-stomp",
- "rustfn-users",
- "rustfn-xmpp",
- "tokio",
-]
-
-[[package]]
-name = "rustfn-auth"
-version = "0.1.0"
-dependencies = [
  "base64 0.22.1",
- "chrono",
- "rand_core 0.6.4",
- "rustfn-http",
- "rustfn-protocol",
- "secrecy",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "wiremock",
- "zeroize",
-]
-
-[[package]]
-name = "rustfn-chat"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
+ "bytes",
  "chrono",
  "dashmap",
  "ed25519-dalek",
- "rand_core 0.6.4",
- "rustfn-friends",
- "rustfn-http",
- "rustfn-protocol",
- "rustfn-xmpp",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "rustfn-client"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "chrono",
  "futures-util",
- "rustfn-auth",
- "rustfn-chat",
- "rustfn-events",
- "rustfn-friends",
- "rustfn-http",
- "rustfn-party",
- "rustfn-protocol",
- "rustfn-stomp",
- "rustfn-users",
- "rustfn-xmpp",
- "secrecy",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tracing",
- "url",
- "wiremock",
-]
-
-[[package]]
-name = "rustfn-commands"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dashmap",
- "rustfn-auth",
- "rustfn-chat",
- "rustfn-client",
- "rustfn-events",
- "rustfn-friends",
- "rustfn-party",
- "rustfn-protocol",
- "secrecy",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rustfn-events"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "rustfn-auth",
- "rustfn-chat",
- "rustfn-friends",
- "rustfn-http",
- "rustfn-party",
- "rustfn-protocol",
- "rustfn-stomp",
- "rustfn-users",
- "rustfn-xmpp",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rustfn-friends"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dashmap",
- "rustfn-http",
- "rustfn-protocol",
- "rustfn-stomp",
- "rustfn-users",
- "rustfn-xmpp",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rustfn-http"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "dashmap",
- "reqwest",
- "rustfn-protocol",
- "secrecy",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "rustfn-party"
-version = "0.1.0"
-dependencies = [
- "chrono",
+ "quick-xml",
  "rand_core 0.6.4",
- "rustfn-chat",
- "rustfn-friends",
- "rustfn-http",
- "rustfn-protocol",
- "rustfn-stomp",
- "rustfn-users",
- "rustfn-xmpp",
+ "reqwest",
  "secrecy",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "rustfn-protocol"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
  "serde",
  "serde_json",
  "thiserror",
- "zeroize",
-]
-
-[[package]]
-name = "rustfn-stomp"
-version = "0.1.0"
-dependencies = [
- "futures-util",
- "rand_core 0.6.4",
- "rustfn-http",
- "rustfn-protocol",
- "secrecy",
- "serde",
- "serde_json",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "rustfn-users"
-version = "0.1.0"
-dependencies = [
- "dashmap",
- "rustfn-http",
- "rustfn-protocol",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "rustfn-xmpp"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "dashmap",
- "futures-util",
- "quick-xml",
- "rustfn-http",
- "rustfn-protocol",
- "secrecy",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tracing",
+ "url",
  "uuid",
+ "wiremock",
+ "zeroize",
 ]
 
 [[package]]

@@ -48,11 +48,7 @@ impl DefaultHelpCommand {
         Command::new(name, move |ctx| {
             let responder = Arc::clone(&responder);
             async move {
-                let target = if ctx.raw_args.is_empty() {
-                    None
-                } else {
-                    Some(ctx.raw_args.clone())
-                };
+                let target = (!ctx.raw_args.is_empty()).then(|| ctx.raw_args.clone());
                 responder.send_help(ctx, target).await
             }
         })
@@ -143,9 +139,9 @@ impl HelpResponder for DefaultHelpCommand {
             None => self.format_bot_help(&prefix),
             Some(query) => {
                 let guard = self
-            .commands
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .commands
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match guard.get(&query) {
                     Some(cmd) => self.format_command_help(&prefix, &cmd),
                     None => format!("No command called \"{query}\" found."),

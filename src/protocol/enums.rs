@@ -429,11 +429,7 @@ pub enum SignedMessageType {
     System,
 }
 
-/// Extensible Fortnite playlist identifier.
-///
-/// Fortnite introduces new playlists dynamically across live updates, so any string
-/// is preserved while common Battle Royale / Zero Build presets are provided as
-/// associated constants.
+/// Preserves any playlist ID, including ones introduced in future updates.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Playlist(String);

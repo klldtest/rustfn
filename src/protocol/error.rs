@@ -17,6 +17,8 @@ pub mod error_codes {
         "errors.com.epicgames.oauth.corrective_action_required";
     pub const INVALID_ACCOUNT_CREDENTIALS: &str =
         "errors.com.epicgames.account.invalid_account_credentials";
+    pub const INVALID_REFRESH_TOKEN: &str =
+        "errors.com.epicgames.account.auth_token.invalid_refresh_token";
     pub const AUTHORIZATION_CODE_NOT_FOUND: &str =
         "errors.com.epicgames.account.oauth.authorization_code_not_found";
     pub const AUTHORIZATION_PENDING: &str =
@@ -76,7 +78,6 @@ pub struct EpicgamesAPIErrorData {
 }
 
 impl EpicgamesAPIErrorData {
-    /// Returns the primary Epic error code, falling back to OAuth `error` when `errorCode` is absent.
     pub fn effective_code(&self) -> &str {
         if !self.error_code.is_empty() {
             &self.error_code
@@ -85,20 +86,23 @@ impl EpicgamesAPIErrorData {
         }
     }
 
-    /// Returns the human-readable error message, falling back to `error_description`.
     pub fn effective_message(&self) -> &str {
         if !self.error_message.is_empty() {
             &self.error_message
-        } else if let Some(desc) = self.error_description.as_deref() {
-            desc
         } else {
-            self.effective_code()
+            self.error_description
+                .as_deref()
+                .unwrap_or_else(|| self.effective_code())
         }
     }
 
     pub fn is_invalid_token(&self) -> bool {
         let code = self.effective_code();
         INVALID_TOKEN_CODES.contains(&code)
+    }
+
+    pub fn is_invalid_refresh_token(&self) -> bool {
+        self.effective_code() == error_codes::INVALID_REFRESH_TOKEN
     }
 
     pub fn is_stale_revision(&self) -> bool {
@@ -157,7 +161,6 @@ impl fmt::Display for EpicgamesAPIErrorData {
 
 impl std::error::Error for EpicgamesAPIErrorData {}
 
-/// Top-level error enum shared across `rustfn` workspace crates.
 #[derive(Debug, Error)]
 pub enum RustfnError {
     #[error("Epic API error (HTTP {status}): {body}")]
@@ -207,6 +210,11 @@ impl RustfnError {
             || self
                 .as_epic_api()
                 .is_some_and(|(_, err)| err.is_invalid_token())
+    }
+
+    pub fn is_invalid_refresh_token(&self) -> bool {
+        self.as_epic_api()
+            .is_some_and(|(_, err)| err.is_invalid_refresh_token())
     }
 
     pub fn is_stale_revision(&self) -> bool {

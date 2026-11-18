@@ -45,11 +45,9 @@ pub fn calculate_squad_assignments(
     let mut seen: HashSet<AccountId> = HashSet::with_capacity(member_ids.len());
     let mut ordered: Vec<AccountId> = Vec::with_capacity(member_ids.len());
 
-    let push_if_eligible = |candidate: &AccountId,
-                            seen: &mut HashSet<AccountId>,
-                            ordered: &mut Vec<AccountId>| {
-        if !hidden_ids.contains(candidate)
-            && member_ids.iter().any(|m| m == candidate)
+    let mut push_if_eligible = |candidate: &AccountId| {
+        if member_ids.contains(candidate)
+            && !hidden_ids.contains(candidate)
             && seen.insert(candidate.clone())
         {
             ordered.push(candidate.clone());
@@ -59,11 +57,11 @@ pub fn calculate_squad_assignments(
     for priority in priorities {
         match priority {
             SquadPositionPriority::SelfFirst => {
-                push_if_eligible(self_id, &mut seen, &mut ordered);
+                push_if_eligible(self_id);
             }
             SquadPositionPriority::LeaderFirst => {
                 if let Some(leader) = leader_id {
-                    push_if_eligible(leader, &mut seen, &mut ordered);
+                    push_if_eligible(leader);
                 }
             }
         }
@@ -241,7 +239,6 @@ impl PartyMeta {
         self.0.apply_patch(patch);
     }
 
-    /// Builds the default Fortnite party metadata map.
     pub fn default_for_client(
         eos_party_id: &PartyId,
         region: Region,
@@ -404,7 +401,6 @@ impl PartyMeta {
             .map(|w| w.privacy_settings)
     }
 
-    /// Resolves the matching [`FortnitePartyPrivacy`] preset from `Default:PrivacySettings_j`.
     pub fn matched_privacy(&self) -> Option<FortnitePartyPrivacy> {
         let settings = self.privacy_settings()?;
         const PRESETS: [PartyPrivacyPreset; 5] = [

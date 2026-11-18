@@ -184,7 +184,6 @@ impl HttpRequestSpec {
 
 }
 
-/// Raw HTTP response payload returned by [`HttpClient::execute_bytes`].
 #[derive(Debug, Clone)]
 pub struct HttpResponseBytes {
     pub status: u16,
@@ -192,7 +191,7 @@ pub struct HttpResponseBytes {
     pub body: Bytes,
 }
 
-/// Pooled asynchronous HTTP transport with Epic rate-limit barriers, backoff, and token refresh.
+/// Pooled asynchronous HTTP transport with rate-limit barriers, backoff, and token refresh.
 #[derive(Clone)]
 pub struct HttpClient {
     inner: reqwest::Client,
@@ -223,8 +222,6 @@ impl HttpClient {
         })
     }
 
-    /// Creates a sibling client sharing the same pooled sockets and global rate-limit registry,
-    /// bound to a separate [`TokenProvider`].
     pub fn share_pool(&self, provider: Arc<dyn TokenProvider>) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -234,8 +231,6 @@ impl HttpClient {
         }
     }
 
-    /// Creates an unauthenticated sibling client sharing the same pooled sockets and global
-    /// rate-limit registry, suitable for OAuth grant and token refresh calls.
     pub fn share_pool_anonymous(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -279,9 +274,7 @@ impl HttpClient {
             }
 
             let mut used_bearer: Option<SecretString> = None;
-            let mut builder = self.inner.request(spec.method.clone(), &spec.url);
-
-            builder = builder
+            let mut builder = self.inner.request(spec.method.clone(), &spec.url)
                 .header(USER_AGENT, &self.config.user_agent)
                 .header(ACCEPT_LANGUAGE, &self.config.accept_language);
 
@@ -384,19 +377,12 @@ impl HttpClient {
                     if retry_after <= retry.max_retry_after {
                         let wait = retry_after + retry.retry_after_padding;
                         if total_slept + wait <= retry.max_wait_time {
-                            if let Some(hook) = spec.retry_decision.as_ref() {
-                                match hook() {
-                                    RetryDecision::Retry => {}
-                                    RetryDecision::Abandon => return Err(RustfnError::Cancelled),
-                                    RetryDecision::Throw => {
-                                        return Err(build_http_error(
-                                            status.as_u16(),
-                                            parsed_epic_error,
-                                            &body,
-                                        ));
-                                    }
-                                }
-                            }
+                            check_retry_hook(
+                                spec.retry_decision.as_ref(),
+                                status.as_u16(),
+                                &parsed_epic_error,
+                                &body,
+                            )?;
 
                             total_slept += wait;
                             let _guard = self
@@ -404,19 +390,12 @@ impl HttpClient {
                                 .enter_cooldown(throttle_key.clone(), wait);
                             tokio::time::sleep(wait).await;
 
-                            if let Some(hook) = spec.retry_decision.as_ref() {
-                                match hook() {
-                                    RetryDecision::Retry => {}
-                                    RetryDecision::Abandon => return Err(RustfnError::Cancelled),
-                                    RetryDecision::Throw => {
-                                        return Err(build_http_error(
-                                            status.as_u16(),
-                                            parsed_epic_error,
-                                            &body,
-                                        ));
-                                    }
-                                }
-                            }
+                            check_retry_hook(
+                                spec.retry_decision.as_ref(),
+                                status.as_u16(),
+                                &parsed_epic_error,
+                                &body,
+                            )?;
                             continue;
                         }
                     }
@@ -466,15 +445,11 @@ impl HttpClient {
     }
 
     pub async fn execute_empty(&self, spec: HttpRequestSpec) -> Result<(), RustfnError> {
-        let _ = self.execute_bytes(spec).await?;
-        Ok(())
+        self.execute_bytes(spec).await.map(|_| ())
     }
 }
 
 fn parse_epic_error(body: &[u8]) -> Option<EpicgamesAPIErrorData> {
-    if body.is_empty() {
-        return None;
-    }
     let parsed: EpicgamesAPIErrorData = serde_json::from_slice(body).ok()?;
     if parsed.error_code.is_empty()
         && parsed.error.is_none()
@@ -500,6 +475,23 @@ fn build_http_error(
             status,
             body: String::from_utf8_lossy(raw_body).into_owned(),
         },
+    }
+}
+
+fn check_retry_hook(
+    hook: Option<&RetryDecisionHook>,
+    status: u16,
+    parsed_epic_error: &Option<EpicgamesAPIErrorData>,
+    raw_body: &[u8],
+) -> Result<(), RustfnError> {
+    match hook.map(|f| f()) {
+        None | Some(RetryDecision::Retry) => Ok(()),
+        Some(RetryDecision::Abandon) => Err(RustfnError::Cancelled),
+        Some(RetryDecision::Throw) => Err(build_http_error(
+            status,
+            parsed_epic_error.clone(),
+            raw_body,
+        )),
     }
 }
 

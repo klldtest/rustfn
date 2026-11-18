@@ -1,10 +1,10 @@
 [package]
 name = "rustfn"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "Async Rust client SDK and party/social manager for Epic Online Services and Fortnite"
+description = "Async Rust client for Epic Online Services and Fortnite."
 readme = "README.md"
 
 [[example]]

@@ -1,6 +1,6 @@
 use crate::commands::error::CommandError;
-use dashmap::DashMap;
 use crate::protocol::AccountId;
+use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -83,7 +83,7 @@ impl Cooldown {
 #[derive(Debug)]
 pub struct CooldownMapping {
     original: Cooldown,
-    buckets: DashMap<Option<AccountId>, Mutex<Cooldown>>,
+    buckets: DashMap<Option<AccountId>, Arc<Mutex<Cooldown>>>,
 }
 
 impl CooldownMapping {
@@ -96,11 +96,13 @@ impl CooldownMapping {
 
     pub async fn update_rate_limit(&self, author_id: &AccountId) -> Option<Duration> {
         let key = self.original.bucket.key_for(author_id);
-        let entry = self
+        let bucket = self
             .buckets
             .entry(key)
-            .or_insert_with(|| Mutex::new(self.original.clone()));
-        let mut cooldown = entry.value().lock().await;
+            .or_insert_with(|| Arc::new(Mutex::new(self.original.clone())))
+            .value()
+            .clone();
+        let mut cooldown = bucket.lock().await;
         cooldown.update_rate_limit(Instant::now())
     }
 

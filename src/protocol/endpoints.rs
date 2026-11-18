@@ -414,15 +414,12 @@ macro_rules! define_hex32_id {
         pub struct $name(String);
 
         impl $name {
-            /// Validates and normalizes a 32-character hexadecimal Epic identifier.
+            /// Validates and normalizes a 32-digit hexadecimal ID.
             pub fn parse(value: impl AsRef<str>) -> Result<Self, IdFormatError> {
                 normalize_hex32(value.as_ref()).map(Self)
             }
 
-            /// Wraps a raw identifier without strict hex32 normalization.
-            ///
-            /// Intended for wire payloads where upstream test fixtures or legacy
-            /// services may supply synthetic identifiers.
+            /// Preserves a wire ID without validating its format.
             pub fn from_raw(value: impl Into<String>) -> Self {
                 Self(value.into())
             }
@@ -525,9 +522,7 @@ impl AsRef<str> for LobbyId {
     }
 }
 
-/// Converts an EOS party ID and Fortnite `party:build_id` string into a Fortnite lobby ID
-/// by extracting the numeric `netCL` token after the final `:` and formatting
-/// `{eos_party_id}-{net_cl}-default`.
+/// Builds a Fortnite lobby ID from an EOS party ID and numeric build suffix.
 pub fn to_fortnite_lobby_id(
     eos_party_id: &PartyId,
     party_build_id: &str,

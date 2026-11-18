@@ -152,8 +152,10 @@ fn api_error_deserialization_and_predicates() {
     assert_eq!(oauth_err.effective_message(), "Authorization code not found");
 
     for code in INVALID_TOKEN_CODES {
-        let mut token_err = EpicgamesAPIErrorData::default();
-        token_err.error_code = code.to_owned();
+        let token_err = EpicgamesAPIErrorData {
+            error_code: code.to_owned(),
+            ..Default::default()
+        };
         assert!(token_err.is_invalid_token());
         let wrapped = RustfnError::EpicApi {
             status: 401,

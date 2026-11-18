@@ -1,20 +1,18 @@
+use crate::protocol::{AccountId, EpicgamesAPIErrorData};
 use dashmap::DashMap;
 use reqwest::Method;
 use reqwest::header::HeaderMap;
-use crate::protocol::{AccountId, EpicgamesAPIErrorData};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use url::Url;
 
-/// Rate-limit barrier isolation scope across sessions sharing an [`crate::http::HttpClient`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ThrottleScope {
     Global,
     PerAccount(AccountId),
 }
 
-/// Normalized endpoint key indexing rate-limit barriers across requests.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ThrottleKey {
     pub scope: ThrottleScope,
@@ -29,56 +27,45 @@ impl ThrottleKey {
         explicit_route: Option<&str>,
         account_scope: Option<&AccountId>,
     ) -> Self {
-        let route_template = explicit_route
-            .map(str::to_owned)
-            .unwrap_or_else(|| sanitize_route_template(url));
-        let scope = match account_scope {
-            Some(account_id) => ThrottleScope::PerAccount(account_id.clone()),
-            None => ThrottleScope::Global,
-        };
         Self {
-            scope,
+            scope: account_scope
+                .cloned()
+                .map_or(ThrottleScope::Global, ThrottleScope::PerAccount),
             method: method.clone(),
-            route_template,
+            route_template: explicit_route
+                .map(str::to_owned)
+                .unwrap_or_else(|| sanitize_route_template(url)),
         }
     }
 }
 
-/// Strips query strings and normalizes 32-char hexadecimal path segments into `{id}`
-/// so shared endpoints coalesce accurately onto one throttle bucket.
+/// Normalizes 32-hex and lobby ID path segments so shared endpoints share one throttle bucket.
 pub fn sanitize_route_template(raw_url: &str) -> String {
-    match Url::parse(raw_url) {
-        Ok(url) => {
-            let normalized_path = url
-                .path()
-                .split('/')
-                .map(|seg| {
-                    if is_hex32(seg) {
-                        "{id}"
-                    } else if seg.len() > 40 && seg.ends_with("-default") {
-                        "{lobby_id}"
-                    } else {
-                        seg
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("/");
-            format!(
-                "{}://{}{}",
-                url.scheme(),
-                url.host_str().unwrap_or_default(),
-                normalized_path
-            )
-        }
-        Err(_) => raw_url.split('?').next().unwrap_or(raw_url).to_owned(),
-    }
+    let Ok(url) = Url::parse(raw_url) else {
+        return raw_url.split('?').next().unwrap_or(raw_url).to_owned();
+    };
+    let path = url
+        .path()
+        .split('/')
+        .map(|seg| {
+            if seg.len() == 32 && seg.bytes().all(|b| b.is_ascii_hexdigit()) {
+                "{id}"
+            } else if seg.len() > 40 && seg.ends_with("-default") {
+                "{lobby_id}"
+            } else {
+                seg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    format!(
+        "{}://{}{}",
+        url.scheme(),
+        url.host_str().unwrap_or_default(),
+        path
+    )
 }
 
-fn is_hex32(segment: &str) -> bool {
-    segment.len() == 32 && segment.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-/// Caller-supplied hook indicating how a rate-limit pause should proceed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryDecision {
     Retry,
@@ -86,10 +73,8 @@ pub enum RetryDecision {
     Throw,
 }
 
-/// Optional callback consulted before sleeping on HTTP 429 / Epic throttling.
 pub type RetryDecisionHook = Arc<dyn Fn() -> RetryDecision + Send + Sync>;
 
-/// Retry and backoff thresholds for Epic REST requests.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     pub max_retry_attempts: usize,
@@ -103,6 +88,22 @@ pub struct RetryConfig {
     pub handle_rate_limits: bool,
     pub handle_capacity_throttling: bool,
     pub other_requests_wait: bool,
+}
+
+impl PartialEq for RetryConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_retry_attempts == other.max_retry_attempts
+            && self.rest_retry_limit == other.rest_retry_limit
+            && self.max_wait_time == other.max_wait_time
+            && self.max_retry_after == other.max_retry_after
+            && self.backoff_start == other.backoff_start
+            && self.backoff_factor.to_bits() == other.backoff_factor.to_bits()
+            && self.backoff_cap == other.backoff_cap
+            && self.retry_after_padding == other.retry_after_padding
+            && self.handle_rate_limits == other.handle_rate_limits
+            && self.handle_capacity_throttling == other.handle_capacity_throttling
+            && self.other_requests_wait == other.other_requests_wait
+    }
 }
 
 impl Default for RetryConfig {
@@ -123,26 +124,24 @@ impl Default for RetryConfig {
     }
 }
 
-/// Extracts retry-after duration from HTTP response headers or Epic API error payloads.
-///
-/// Precedence:
-/// 1. `Retry-After` HTTP header (integer seconds)
-/// 2. `messageVars[0]` when numeric
-/// 3. `"in <N> second"` inside `errorMessage`
+/// Reads retry delay from the header, API variables, or error text, in that order.
 pub fn extract_retry_after(
     headers: &HeaderMap,
     api_error: Option<&EpicgamesAPIErrorData>,
 ) -> Option<Duration> {
-    if let Some(val) = headers.get(reqwest::header::RETRY_AFTER)
-        && let Ok(text) = val.to_str()
-        && let Ok(secs) = text.trim().parse::<u64>()
+    if let Some(secs) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
     {
         return Some(Duration::from_secs(secs));
     }
 
     let err = api_error?;
-    if let Some(first_var) = err.message_vars.first()
-        && let Ok(secs) = first_var.trim().parse::<u64>()
+    if let Some(secs) = err
+        .message_vars
+        .first()
+        .and_then(|v| v.trim().parse::<u64>().ok())
     {
         return Some(Duration::from_secs(secs));
     }
@@ -175,13 +174,11 @@ struct BarrierState {
     ends_at: Instant,
 }
 
-/// Coordinates global and per-account rate-limit backoff barriers across concurrent requests.
 #[derive(Debug, Default)]
 pub struct EndpointRateLimiter {
     active: DashMap<ThrottleKey, BarrierState>,
 }
 
-/// RAII guard releasing waiting requests on a throttled endpoint when dropped.
 pub struct ThrottleBarrierGuard<'a> {
     limiter: &'a EndpointRateLimiter,
     key: ThrottleKey,
@@ -202,16 +199,13 @@ impl EndpointRateLimiter {
         Self::default()
     }
 
-    /// Blocks until any active rate-limit window on `key` clears.
     pub async fn wait_if_limited(&self, key: &ThrottleKey) {
         loop {
-            let state = match self.active.get(key) {
-                Some(entry) => entry.clone(),
-                None => return,
+            let Some(state) = self.active.get(key).map(|e| e.clone()) else {
+                return;
             };
 
-            let now = Instant::now();
-            if now >= state.ends_at {
+            if Instant::now() >= state.ends_at {
                 self.active
                     .remove_if(key, |_, current| Arc::ptr_eq(&current.notify, &state.notify));
                 state.notify.notify_waiters();
@@ -227,8 +221,6 @@ impl EndpointRateLimiter {
         }
     }
 
-    /// Registers a rate-limit cooldown window of `duration`, returning an RAII guard
-    /// that wakes waiters on completion or cancellation.
     pub fn enter_cooldown(
         &self,
         key: ThrottleKey,

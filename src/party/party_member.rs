@@ -125,10 +125,10 @@ impl PartyMemberSnapshot {
         self.revision = revision;
         if let Some(dn) = account_dn.filter(|s| !s.is_empty()) {
             self.display_name = Some(dn);
-        } else if let Some(dn) = updated.get_str("urn:epic:member:dn_s") {
-            if !dn.is_empty() {
-                self.display_name = Some(dn.to_owned());
-            }
+        } else if let Some(dn) = updated.get_str("urn:epic:member:dn_s")
+            && !dn.is_empty()
+        {
+            self.display_name = Some(dn.to_owned());
         }
 
         let patch = MetaPatch {

@@ -1,9 +1,9 @@
-use dashmap::DashMap;
 use crate::http::{
     AccountRecordResponse, AvatarResponse, HTTP, GlobalProfileItemResponse,
     UserSearchEntryResponse,
 };
 use crate::protocol::{AccountId, CacheConfig, RustfnError, UserSearchPlatform};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -13,7 +13,7 @@ use tokio::time::Instant;
 
 const ACCOUNT_BATCH_CHUNK_SIZE: usize = 100;
 
-/// Public + self-optional profile attributes for an Epic Games account.
+/// Epic account profile, including fields available only to the account owner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserProfile {
     pub id: AccountId,
@@ -77,7 +77,7 @@ struct CachedUser {
     is_partial: bool,
 }
 
-/// TTL-bounded concurrent user cache and account lookup manager.
+/// Account lookup and TTL cache.
 pub struct UserManager {
     http: HTTP,
     config: CacheConfig,
@@ -111,16 +111,13 @@ impl UserManager {
         Ok(profile)
     }
 
-    /// Returns a cached non-expired full user profile if present.
     pub fn get_cached(&self, account_id: &AccountId) -> Option<UserProfile> {
         let entry = self.cache.get(account_id)?;
-        if !entry.is_partial && entry.fetched_at.elapsed() < self.config.user_ttl {
-            return Some(entry.profile.clone());
-        }
-        None
+        (!entry.is_partial && entry.fetched_at.elapsed() < self.config.user_ttl)
+            .then(|| entry.profile.clone())
     }
 
-    /// Seeds partial `(account_id, display_name)` data learned from XMPP/STOMP without overwriting fresh full entries.
+    /// Seeds partial `(account_id, display_name)` data without overwriting fresh full entries.
     pub fn upsert_partial(&self, account_id: &AccountId, display_name: Option<String>) {
         if let Some(mut entry) = self.cache.get_mut(account_id) {
             if entry.profile.display_name.is_none() && display_name.is_some() {
@@ -131,24 +128,15 @@ impl UserManager {
         self.insert_cached(UserProfile::partial(account_id.clone(), display_name), true);
     }
 
-    /// Fetches a single user profile by ID, hitting the fresh TTL cache when possible.
     pub async fn fetch(&self, account_id: &AccountId) -> Result<UserProfile, RustfnError> {
         if let Some(cached) = self.get_cached(account_id) {
             return Ok(cached);
         }
 
         let record = self.http.fetch_account_by_id(account_id).await?;
-        let mut profile = UserProfile::from_account_record(record);
-        if let Some(existing) = self.cache.get(account_id)
-            && profile.avatar_id.is_none()
-        {
-            profile.avatar_id = existing.profile.avatar_id.clone();
-        }
-        self.insert_cached(profile.clone(), false);
-        Ok(profile)
+        Ok(self.cache_full(UserProfile::from_account_record(record)))
     }
 
-    /// Fetches a single user profile by Epic display name and caches the resulting profile.
     pub async fn fetch_by_display_name(
         &self,
         display_name: &str,
@@ -159,7 +147,6 @@ impl UserManager {
         Ok(profile)
     }
 
-    /// Fetches a user by either 32-hex account ID or display name.
     pub async fn fetch_by_query(&self, id_or_display_name: &str) -> Result<UserProfile, RustfnError> {
         if let Ok(account_id) = AccountId::parse(id_or_display_name) {
             self.fetch(&account_id).await
@@ -168,7 +155,6 @@ impl UserManager {
         }
     }
 
-    /// Resolves a 32-hex account ID without network calls, or queries by display name on miss.
     pub async fn resolve_id(&self, id_or_display_name: &str) -> Result<AccountId, RustfnError> {
         if let Ok(account_id) = AccountId::parse(id_or_display_name) {
             return Ok(account_id);
@@ -176,7 +162,6 @@ impl UserManager {
         Ok(self.fetch_by_display_name(id_or_display_name).await?.id)
     }
 
-    /// Batch-fetches profiles for multiple account IDs using cache hits plus 100-ID HTTP chunks.
     pub async fn fetch_multiple(
         &self,
         account_ids: &[AccountId],
@@ -190,15 +175,8 @@ impl UserManager {
         }
 
         for chunk in missing.chunks(ACCOUNT_BATCH_CHUNK_SIZE) {
-            let records = self.http.fetch_accounts_multiple(chunk).await?;
-            for record in records {
-                let mut profile = UserProfile::from_account_record(record);
-                if let Some(existing) = self.cache.get(&profile.id)
-                    && profile.avatar_id.is_none()
-                {
-                    profile.avatar_id = existing.profile.avatar_id.clone();
-                }
-                self.insert_cached(profile, false);
+            for record in self.http.fetch_accounts_multiple(chunk).await? {
+                self.cache_full(UserProfile::from_account_record(record));
             }
         }
 
@@ -246,13 +224,12 @@ impl UserManager {
     ) -> Result<Vec<UserGlobalProfile>, RustfnError> {
         let mut all = Vec::with_capacity(account_ids.len());
         for chunk in account_ids.chunks(ACCOUNT_BATCH_CHUNK_SIZE) {
-            let batch = self.http.fetch_global_profiles_multiple(chunk).await?;
-            all.extend(batch);
+            all.extend(self.http.fetch_global_profiles_multiple(chunk).await?);
         }
         Ok(all)
     }
 
-    /// Removes expired cache entries and trims oldest records beyond `CacheConfig::max_users`.
+    /// Removes expired and oldest entries to respect the cache limit.
     pub fn sweep_expired(&self) -> usize {
         let ttl = self.config.user_ttl;
         let before = self.cache.len();
@@ -273,6 +250,16 @@ impl UserManager {
         }
 
         before.saturating_sub(self.cache.len())
+    }
+
+    fn cache_full(&self, mut profile: UserProfile) -> UserProfile {
+        if let Some(existing) = self.cache.get(&profile.id)
+            && profile.avatar_id.is_none()
+        {
+            profile.avatar_id = existing.profile.avatar_id.clone();
+        }
+        self.insert_cached(profile.clone(), false);
+        profile
     }
 
     fn insert_cached(&self, profile: UserProfile, is_partial: bool) {

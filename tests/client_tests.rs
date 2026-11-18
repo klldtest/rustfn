@@ -127,9 +127,11 @@ impl MockEnv {
 
     fn client_config(&self) -> ClientConfig {
         let base = self.http_server.uri();
-        let mut cfg = ClientConfig::default();
-        cfg.check_eula = false;
-        cfg.party_build_id = Some("1:3:39001234".to_owned());
+        let mut cfg = ClientConfig {
+            check_eula: false,
+            party_build_id: Some("1:3:39001234".to_owned()),
+            ..Default::default()
+        };
         cfg.endpoints = ServiceEndpoints {
             oauth_token_create: format!("{base}/account/api/oauth/token").into(),
             oauth_token_verify: format!("{base}/account/api/oauth/verify").into(),
@@ -1124,11 +1126,13 @@ async fn set_status_publishes_fortnite_lobby_id_in_party_join_info() {
     let party = client.party().await.expect("active party");
     client.set_status(None, None).await.expect("set_status succeeds");
 
-    let patches = env
+    let last_patch = env
         .eos_presence_patches
         .lock()
-        .expect("eos presence patches lock");
-    let last_patch = patches.last().expect("eos presence patch recorded");
+        .expect("eos presence patches lock")
+        .last()
+        .cloned()
+        .expect("eos presence patch recorded");
     let raw_join = last_patch["props"]["party.joininfodata.286331153"]
         .as_str()
         .expect("joininfodata string");
@@ -1162,7 +1166,6 @@ async fn set_status_publishes_fortnite_lobby_id_in_party_join_info() {
     assert!(xmpp_join_val.get("notAcceptingReason").is_some());
     assert!(xmpp_join_val.get("notAcceptingMembersReason").is_none());
 
-    drop(patches);
     client.logout().await.expect("logout");
 }
 

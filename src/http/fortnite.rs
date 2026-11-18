@@ -1,5 +1,4 @@
-use crate::http::http::{AuthSessionSlot, HttpClient, HttpRequestSpec};
-use crate::http::rate_limiter::RetryDecisionHook;
+use crate::http::{AuthSessionSlot, HttpClient, HttpRequestSpec, RetryDecisionHook};
 use crate::protocol::{
     AccountId, ConversationType, EOSPartyData, EOSPartyDataConfig, EOSPartyUserState,
     ExtraServiceEndpoints, FORTNITE_CATALOG_ITEM_ID, LobbyId, MetaMap, MetaPatch,

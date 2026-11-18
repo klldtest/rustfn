@@ -1,6 +1,6 @@
+use crate::protocol::{AccountId, MetaMap, PartyId};
 use crate::xmpp::message::XMPPPartyMemberDeltaNotification;
 use dashmap::DashMap;
-use crate::protocol::{AccountId, MetaMap, PartyId};
 use std::time::{Duration, Instant};
 
 /// Default lifetime for buffered XMPP member state deltas awaiting STOMP `MEMBER_JOINED`.
@@ -28,25 +28,17 @@ impl From<XMPPPartyMemberDeltaNotification> for QueuedMemberMetadataUpdate {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct StoreKey {
-    party_id: PartyId,
-    account_id: AccountId,
-}
-
 #[derive(Debug, Clone)]
 struct EntryBucket {
     updates: Vec<QueuedMemberMetadataUpdate>,
     expires_at: Instant,
 }
 
-/// 10-second TTL buffer holding out-of-order XMPP member deltas until STOMP creates the member slot.
-///
-/// Uses timestamped buckets and synchronous expiration sweeps to avoid per-entry timers.
+/// Buffers out-of-order XMPP member deltas until STOMP creates the member slot.
 #[derive(Debug)]
 pub struct XMPPMetadataStore {
     ttl: Duration,
-    entries: DashMap<StoreKey, EntryBucket>,
+    entries: DashMap<(PartyId, AccountId), EntryBucket>,
 }
 
 impl Default for XMPPMetadataStore {
@@ -63,14 +55,10 @@ impl XMPPMetadataStore {
         }
     }
 
-    /// Buffers a member metadata update under `(party_id, update.account_id)` and refreshes its TTL.
     pub fn push(&self, party_id: PartyId, update: QueuedMemberMetadataUpdate) {
         self.purge_expired();
         let now = Instant::now();
-        let key = StoreKey {
-            party_id,
-            account_id: update.account_id.clone(),
-        };
+        let key = (party_id, update.account_id.clone());
         let mut entry = self.entries.entry(key).or_insert_with(|| EntryBucket {
             updates: Vec::new(),
             expires_at: now + self.ttl,
@@ -82,18 +70,14 @@ impl XMPPMetadataStore {
         entry.expires_at = now + self.ttl;
     }
 
-    /// Drains all non-expired buffered deltas for `(party_id, account_id)`, sorted by `revision`
-    /// ascending and discarding stale entries with `revision < min_revision`.
+    /// Drains non-expired updates in revision order, skipping stale revisions.
     pub fn drain_sorted(
         &self,
         party_id: &PartyId,
         account_id: &AccountId,
         min_revision: u64,
     ) -> Vec<QueuedMemberMetadataUpdate> {
-        let key = StoreKey {
-            party_id: party_id.clone(),
-            account_id: account_id.clone(),
-        };
+        let key = (party_id.clone(), account_id.clone());
         let Some((_, mut bucket)) = self.entries.remove(&key) else {
             return Vec::new();
         };
@@ -109,11 +93,7 @@ impl XMPPMetadataStore {
     }
 
     pub fn discard(&self, party_id: &PartyId, account_id: &AccountId) {
-        let key = StoreKey {
-            party_id: party_id.clone(),
-            account_id: account_id.clone(),
-        };
-        self.entries.remove(&key);
+        self.entries.remove(&(party_id.clone(), account_id.clone()));
     }
 
     pub fn clear(&self) {

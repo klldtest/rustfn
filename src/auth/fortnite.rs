@@ -270,7 +270,7 @@ pub async fn ensure_eula_accepted(
         .await?;
 
     let trimmed = String::from_utf8_lossy(&check_resp.body);
-    if check_resp.body.is_empty() || trimmed.trim().is_empty() || trimmed.trim() == "null" {
+    if matches!(trimmed.trim(), "" | "null") {
         return Ok(EulaCheckOutcome::AlreadyAccepted);
     }
 
@@ -317,9 +317,7 @@ pub fn open_url_in_browser(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
-/// Runs the OAuth2 RFC 8628 device authorization flow using `AuthClient::FortniteNewSwitchGameClient`,
-/// invoking `on_prompt` once with the verification URL and user code, polling until completion or cancellation,
-/// and exchanging the Switch token onto `client`.
+/// Runs the OAuth2 device authorization flow via Switch client and exchanges onto `client`.
 pub async fn authenticate_device_code<F, Fut>(
     http: &HttpClient,
     endpoints: &ServiceEndpoints,
@@ -342,8 +340,6 @@ where
     .await
 }
 
-/// Runs the OAuth2 device authorization flow with an explicit `switch_client` and exchanges
-/// the resulting Switch grant onto `client`.
 pub async fn authenticate_device_code_with_switch<F, Fut>(
     http: &HttpClient,
     endpoints: &ServiceEndpoints,
@@ -486,7 +482,19 @@ pub struct EOSTokenInfoResponse {
     pub application_id: Option<String>,
 }
 
-/// Exchanges a short-lived Epic exchange code for an EOS `epic_id` Connect token.
+async fn eos_token_grant(
+    http: &HttpClient,
+    endpoints: &ServiceEndpoints,
+    client: AuthClient,
+    fields: Vec<(String, String)>,
+) -> Result<EOSOAuthTokenResponse, RustfnError> {
+    let basic = client.basic_auth_header();
+    let spec = HttpRequestSpec::post(endpoints.eos_token.as_ref())
+        .with_authorization(basic.as_str())?
+        .with_form(fields);
+    http.execute_json(spec).await
+}
+
 pub async fn authenticate_eos_exchange(
     http: &HttpClient,
     endpoints: &ServiceEndpoints,
@@ -494,20 +502,21 @@ pub async fn authenticate_eos_exchange(
     exchange_code: &SecretString,
     deployment_id: &str,
 ) -> Result<EOSOAuthTokenResponse, RustfnError> {
-    let basic = client.basic_auth_header();
-    let spec = HttpRequestSpec::post(endpoints.eos_token.as_ref())
-        .with_authorization(basic.as_str())?
-        .with_form(vec![
+    eos_token_grant(
+        http,
+        endpoints,
+        client,
+        vec![
             ("grant_type".into(), "exchange_code".into()),
             ("exchange_code".into(), exchange_code.expose_secret().to_owned()),
             ("token_type".into(), "epic_id".into()),
             ("deployment_id".into(), deployment_id.to_owned()),
-        ]);
-    http.execute_json(spec).await
+        ],
+    )
+    .await
 }
 
-/// Exchanges an external Epic Games access token for an EOS Connect token,
-/// automatically continuing `/auth/v1/users` if EOS returns `user_not_found`.
+/// Exchanges an external Epic token for an EOS Connect token, continuing `/auth/v1/users` on `user_not_found`.
 pub async fn grant_eos_external_auth(
     http: &HttpClient,
     endpoints: &ServiceEndpoints,
@@ -519,21 +528,18 @@ pub async fn grant_eos_external_auth(
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
 
-    let basic = client.basic_auth_header();
-    let spec = HttpRequestSpec::post(endpoints.eos_token.as_ref())
-        .with_authorization(basic.as_str())?
-        .with_form(vec![
-            ("grant_type".into(), "external_auth".into()),
-            ("external_auth_type".into(), "epicgames_access_token".into()),
-            (
-                "external_auth_token".into(),
-                external_auth_token.expose_secret().to_owned(),
-            ),
-            ("deployment_id".into(), deployment_id.to_owned()),
-            ("nonce".into(), nonce),
-        ]);
+    let fields = vec![
+        ("grant_type".into(), "external_auth".into()),
+        ("external_auth_type".into(), "epicgames_access_token".into()),
+        (
+            "external_auth_token".into(),
+            external_auth_token.expose_secret().to_owned(),
+        ),
+        ("deployment_id".into(), deployment_id.to_owned()),
+        ("nonce".into(), nonce),
+    ];
 
-    match http.execute_json(spec).await {
+    match eos_token_grant(http, endpoints, client, fields).await {
         Ok(tok) => Ok(tok),
         Err(RustfnError::EpicApi { ref body, .. })
             if body.effective_code() == "errors.com.epicgames.eos.auth.user_not_found" =>
@@ -564,12 +570,7 @@ pub async fn refresh_eos_token(
         .collect();
     form.push(("grant_type".into(), "refresh_token".into()));
     form.push(("refresh_token".into(), refresh_token.expose_secret().to_owned()));
-
-    let basic = client.basic_auth_header();
-    let spec = HttpRequestSpec::post(endpoints.eos_token.as_ref())
-        .with_authorization(basic.as_str())?
-        .with_form(form);
-    http.execute_json(spec).await
+    eos_token_grant(http, endpoints, client, form).await
 }
 
 pub async fn verify_eos_token(

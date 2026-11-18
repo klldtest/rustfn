@@ -10,11 +10,16 @@ Async Rust client for Epic Online Services and Fortnite.
 
 ## Installation
 
-Requires Rust 1.88 or newer. Add `rustfn` and Tokio to your `Cargo.toml`:
+Requires Rust 1.88 or newer. Add [rustfn](https://crates.io/crates/rustfn) to your project:
+
+```sh
+cargo add rustfn
+```
+
+For the example below, add this to `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustfn = "0.1.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

@@ -8,7 +8,6 @@ use thiserror::Error;
 
 /// Canonical Fortnite party and member metadata keys present on Epic Party v1 payloads.
 pub mod keys {
-    // Member metadata keys
     pub const ATHENA_COSMETIC_LOADOUT_J: &str = "Default:AthenaCosmeticLoadout_j";
     pub const MP_LOADOUT_1_J: &str = "Default:MpLoadout1_j";
     pub const MP_LOADOUT_2_J: &str = "Default:MpLoadout2_j";
@@ -27,7 +26,6 @@ pub mod keys {
     pub const MATCHMAKING_INFO_J: &str = "Default:MatchmakingInfo_j";
     pub const PACKED_STATE_J: &str = "Default:PackedState_j";
 
-    // Party metadata keys
     pub const PRIVACY_SETTINGS_J: &str = "Default:PrivacySettings_j";
     pub const PARTY_BUILD_ID_S: &str = "Default:PartyBuildId_s";
     pub const REGION_ID_S: &str = "Default:RegionId_s";
@@ -68,22 +66,16 @@ pub enum MetaSuffix {
 }
 
 impl MetaSuffix {
-    /// Determines the wire encoding rule from a metadata key's suffix (`_j`, `_b`, `_U`, `_i`, `_d`, `_s`).
+    /// Returns the wire type encoded in the key suffix.
     pub fn from_key(key: &str) -> Self {
-        if key.ends_with("_j") {
-            Self::Json
-        } else if key.ends_with("_b") {
-            Self::Bool
-        } else if key.ends_with("_U") {
-            Self::UnsignedInt
-        } else if key.ends_with("_i") {
-            Self::SignedInt
-        } else if key.ends_with("_d") {
-            Self::Double
-        } else if key.ends_with("_s") {
-            Self::String
-        } else {
-            Self::Untyped
+        match key.rsplit_once('_').map(|(_, suffix)| suffix) {
+            Some("j") => Self::Json,
+            Some("b") => Self::Bool,
+            Some("U") => Self::UnsignedInt,
+            Some("i") => Self::SignedInt,
+            Some("d") => Self::Double,
+            Some("s") => Self::String,
+            _ => Self::Untyped,
         }
     }
 }
@@ -120,7 +112,7 @@ pub struct MetaMap(BTreeMap<String, String>);
 
 impl MetaMap {
     pub fn new() -> Self {
-        Self(BTreeMap::new())
+        Self::default()
     }
 
     pub fn from_map(map: BTreeMap<String, String>) -> Self {
@@ -316,7 +308,6 @@ impl MetaMap {
         Ok(())
     }
 
-    /// Applies an incoming `updated` + `deleted` delta in place.
     pub fn apply_patch(&mut self, patch: &MetaPatch) {
         for key in &patch.deleted {
             self.0.remove(key);
@@ -326,7 +317,7 @@ impl MetaMap {
         }
     }
 
-    /// Computes the minimal [`MetaPatch`] needed to transform `self` into `next`.
+    /// Returns only the changes needed to turn this map into `next`.
     pub fn diff_to(&self, next: &Self) -> MetaPatch {
         let mut updated = BTreeMap::new();
         let mut deleted = Vec::new();
@@ -358,13 +349,7 @@ impl From<MetaMap> for BTreeMap<String, String> {
     }
 }
 
-/// Typed value carried in Epic Games / Fortnite presence `Properties` maps.
-///
-/// Wire encoding:
-/// - `btrue` / `bfalse` -> [`PresencePropValue::Bool`]
-/// - `i<integer>` -> [`PresencePropValue::Int`]
-/// - `m<json>` -> [`PresencePropValue::Json`]
-/// - `s<text>` (or untagged text fallback) -> [`PresencePropValue::Str`]
+/// Presence property with a tagged wire value or an untagged EOS string.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PresencePropValue {
     Bool(bool),
@@ -396,15 +381,15 @@ impl PresencePropValue {
         if raw == "bfalse" {
             return Self::Bool(false);
         }
-        if let Some(rest) = raw.strip_prefix('i') {
-            if let Ok(parsed) = rest.parse::<i64>() {
-                return Self::Int(parsed);
-            }
+        if let Some(rest) = raw.strip_prefix('i')
+            && let Ok(parsed) = rest.parse::<i64>()
+        {
+            return Self::Int(parsed);
         }
-        if let Some(rest) = raw.strip_prefix('m') {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(rest) {
-                return Self::Json(parsed);
-            }
+        if let Some(rest) = raw.strip_prefix('m')
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(rest)
+        {
+            return Self::Json(parsed);
         }
         if let Some(rest) = raw.strip_prefix('s') {
             return Self::Str(rest.to_owned());

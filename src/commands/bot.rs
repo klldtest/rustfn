@@ -75,14 +75,15 @@ pub struct Bot {
 impl Bot {
     /// Creates a new `Bot` with the given command prefix (string, slice of prefixes, or `PrefixConfig`).
     pub fn new(command_prefix: impl Into<PrefixConfig>) -> Self {
-        let mut config = ClientConfig::default();
-        config.create_device_auth = true;
         Self {
             prefix: command_prefix.into(),
             case_insensitive: false,
             description: String::new(),
             owner_ids: HashSet::new(),
-            config,
+            config: ClientConfig {
+                create_device_auth: true,
+                ..ClientConfig::default()
+            },
             auth: None,
             device_auth_dir: PathBuf::from("./device_auth"),
             help_options: Some(HelpOptions::default()),
@@ -578,7 +579,7 @@ impl BotRuntime {
         loop {
             if current.subcommands.is_empty() {
                 return self
-                    .invoke_leaf_with_view(ctx, &current)
+                    .invoke_single_command(ctx, &current)
                     .await
                     .map_err(|err| (Arc::clone(&current), err));
             }
@@ -624,7 +625,7 @@ impl BotRuntime {
                     ctx.view.previous = saved_prev;
                     if !early_invoke {
                         return self
-                            .invoke_leaf_with_view(ctx, &current)
+                            .invoke_single_command(ctx, &current)
                             .await
                             .map_err(|err| (Arc::clone(&current), err));
                     }
@@ -648,14 +649,6 @@ impl BotRuntime {
         Ok(())
     }
 
-    async fn invoke_leaf_with_view(
-        &self,
-        ctx: &mut Context,
-        cmd: &Arc<Command>,
-    ) -> Result<(), CommandError> {
-        self.invoke_single_command(ctx, cmd).await
-    }
-
     async fn invoke_single_command(
         &self,
         ctx: &mut Context,
@@ -665,7 +658,6 @@ impl BotRuntime {
             return Err(CommandError::DisabledCommand(cmd.qualified_name()));
         }
 
-        // Prepare arguments first so checks can inspect parsed arguments cleanly.
         let mut rest_view = ctx.view.clone();
         rest_view.skip_ws();
         ctx.raw_args = rest_view.read_rest().trim().to_owned();
@@ -1089,7 +1081,6 @@ mod tests {
             })
             .await;
 
-        // Quoted argument via alias + alternate prefix + case-insensitive lookup.
         runtime
             .process_message(IncomingMessage {
                 message_id: "m1".to_owned(),
@@ -1101,7 +1092,6 @@ mod tests {
             .await;
         assert_eq!(cog_hits.load(Ordering::SeqCst), 1);
 
-        // Second invocation triggers per-user cooldown -> captured in on_command_error.
         runtime
             .process_message(IncomingMessage {
                 message_id: "m2".to_owned(),
@@ -1112,7 +1102,6 @@ mod tests {
             })
             .await;
 
-        // Owner check denies guest.
         runtime
             .process_message(IncomingMessage {
                 message_id: "m3".to_owned(),
@@ -1123,7 +1112,6 @@ mod tests {
             })
             .await;
 
-        // Group subcommand in party chat with invoke_without_command = true.
         runtime
             .process_message(IncomingMessage {
                 message_id: "m4".to_owned(),
@@ -1137,7 +1125,6 @@ mod tests {
             .await;
         assert_eq!(*group_log.lock().await, vec!["lock".to_owned()]);
 
-        // Group rejected in DM because of .party_only().
         runtime
             .process_message(IncomingMessage {
                 message_id: "m5".to_owned(),
@@ -1148,7 +1135,6 @@ mod tests {
             })
             .await;
 
-        // Unknown command hits on_command_error with CommandNotFound.
         runtime
             .process_message(IncomingMessage {
                 message_id: "m6".to_owned(),
@@ -1159,7 +1145,6 @@ mod tests {
             })
             .await;
 
-        // Self messages ignored.
         handle_event(
             &runtime,
             Arc::new(ClientEvent::FriendMessage(ReceivedFriendMessage {

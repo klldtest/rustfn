@@ -21,9 +21,7 @@ pub const KEY_UTC_TIME_STARTED_MATCH_ATHENA_S: &str = "Default:UtcTimeStartedMat
 pub const KEY_FRONTEND_MIMOSA_J: &str = "Default:FrontendMimosa_j";
 pub const KEY_EPV: &str = "ePV";
 
-pub const DEFAULT_OUTFIT_CIDS: [&str; 1] = [
-    "CID_DefaultOutfit"
-];
+pub const DEFAULT_OUTFIT_CIDS: [&str; 1] = ["CID_DefaultOutfit"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -464,7 +462,7 @@ impl PartyMemberMeta {
             ("ac", default_outfit, Vec::new()),
             ("ap", "DefaultPickaxe", Vec::new()),
             ("ag", "DefaultGlider", Vec::new()),
-            ("li", "BRS17_Alt_1", Vec::new()),
+            ("li", "SurvivalBannerStonewoodComplete", Vec::new()),
             ("lc", "DefaultColor22", Vec::new()),
             ("vo", "ID_Booster_Standard", vec![json!("0")]),
             ("vd", "ID_DriftTrail_Standard", vec![json!("0")]),
@@ -544,11 +542,11 @@ impl PartyMemberMeta {
     }
 
     pub fn set_eos_product_user_id(&mut self, puid: &str) {
-        if let Ok(Some(mut val)) = self.0.get_json::<Value>(keys::PACKED_STATE_J) {
-            if let Some(packed) = val.get_mut("PackedState").and_then(|v| v.as_object_mut()) {
-                packed.insert("eOSProductUserId".to_owned(), Value::String(puid.to_owned()));
-                let _ = self.0.set_json(keys::PACKED_STATE_J, &val);
-            }
+        if let Ok(Some(mut val)) = self.0.get_json::<Value>(keys::PACKED_STATE_J)
+            && let Some(packed) = val.get_mut("PackedState").and_then(|v| v.as_object_mut())
+        {
+            packed.insert("eOSProductUserId".to_owned(), Value::String(puid.to_owned()));
+            let _ = self.0.set_json(keys::PACKED_STATE_J, &val);
         }
     }
 

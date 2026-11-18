@@ -513,10 +513,10 @@ async fn run_single_stomp_connection(
         }
     };
     request.headers_mut().insert("Authorization", auth_header);
-    if let Some(ref proto) = config.ws_subprotocol {
-        if let Ok(proto_val) = HeaderValue::from_str(proto) {
-            request.headers_mut().insert("Sec-WebSocket-Protocol", proto_val);
-        }
+    if let Some(ref proto) = config.ws_subprotocol
+        && let Ok(proto_val) = HeaderValue::from_str(proto)
+    {
+        request.headers_mut().insert("Sec-WebSocket-Protocol", proto_val);
     }
     request
         .headers_mut()
@@ -738,23 +738,21 @@ async fn run_single_stomp_connection(
                         public_sub_id = Some(pub_id);
                         private_sub_id = Some(priv_id);
 
-                        if config.subscribe_puid {
-                            if let Some(ref puid) = puid_initial {
-                                let puid_id = format!("sub-eosu-{}", next_subscription_hex());
-                                let puid_dest = format!(
-                                    "deploymentId/{}/productUserId/{}",
-                                    config.deployment_id, puid
-                                );
-                                let sub_puid = build_subscribe_frame(
-                                    &puid_id,
-                                    &puid_dest,
-                                    eos_token,
-                                    false,
-                                    sess_id.as_ref().map(|s| format!("sub-2-{s}")),
-                                );
-                                if sink.send(Message::text(sub_puid.encode())).await.is_ok() {
-                                    puid_sub_id = Some(puid_id);
-                                }
+                        if config.subscribe_puid && let Some(ref puid) = puid_initial {
+                            let puid_id = format!("sub-eosu-{}", next_subscription_hex());
+                            let puid_dest = format!(
+                                "deploymentId/{}/productUserId/{}",
+                                config.deployment_id, puid
+                            );
+                            let sub_puid = build_subscribe_frame(
+                                &puid_id,
+                                &puid_dest,
+                                eos_token,
+                                false,
+                                sess_id.as_ref().map(|s| format!("sub-2-{s}")),
+                            );
+                            if sink.send(Message::text(sub_puid.encode())).await.is_ok() {
+                                puid_sub_id = Some(puid_id);
                             }
                         }
                     }
@@ -808,11 +806,11 @@ async fn run_single_stomp_connection(
                                 }
                             };
 
-                        if let Some(ref msg_id) = msg_id {
-                            if !dedupe.mark_if_new(msg_id.clone()) {
-                                trace!(message_id = %msg_id, "dropped duplicate STOMP notification");
-                                continue;
-                            }
+                        if let Some(ref msg_id) = msg_id
+                            && !dedupe.mark_if_new(msg_id.clone())
+                        {
+                            trace!(message_id = %msg_id, "dropped duplicate STOMP notification");
+                            continue;
                         }
 
                         match notification {
@@ -972,9 +970,7 @@ impl STOMPFrame {
             out.push('\n');
         }
         out.push('\n');
-        if !self.body.is_empty() {
-            out.push_str(&self.body);
-        }
+        out.push_str(&self.body);
         out.push('\0');
         out
     }
@@ -1011,7 +1007,6 @@ impl STOMPFrame {
 
         let body = body_and_nul
             .trim_end_matches(['\0', '\r', '\n'])
-            .trim_end_matches('\0')
             .to_owned();
 
         Ok(Some(Self {
@@ -1060,10 +1055,10 @@ impl STOMPMessageDedupe {
         if self.seen.contains(&id) {
             return false;
         }
-        if self.order.len() == self.capacity {
-            if let Some(evicted) = self.order.pop_front() {
-                self.seen.remove(&evicted);
-            }
+        if self.order.len() == self.capacity
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.seen.remove(&evicted);
         }
         self.seen.insert(id.clone());
         self.order.push_back(id);

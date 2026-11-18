@@ -65,7 +65,6 @@ fn stomp_frame_roundtrip_and_dedupe_ring() {
     let reparsed = STOMPFrame::parse(&reencoded).unwrap().unwrap();
     assert_eq!(parsed, reparsed);
 
-    // Pure heartbeat yields None
     assert!(STOMPFrame::parse("\n").unwrap().is_none());
 
     let mut dedupe = STOMPMessageDedupe::new(3);
@@ -73,7 +72,6 @@ fn stomp_frame_roundtrip_and_dedupe_ring() {
     assert!(!dedupe.mark_if_new("m1"));
     assert!(dedupe.mark_if_new("m2"));
     assert!(dedupe.mark_if_new("m3"));
-    // Evicts "m1"
     assert!(dedupe.mark_if_new("m4"));
     assert_eq!(dedupe.len(), 3);
     assert!(dedupe.mark_if_new("m1"));
@@ -104,19 +102,16 @@ async fn stomp_client_subscribes_dedupes_and_recovers_4019() {
 
                 let (mut tx, mut rx) = ws.split();
 
-                // Expect CONNECT
                 let connect_text = rx.next().await.unwrap().unwrap().into_text().unwrap();
                 let connect_frame = STOMPFrame::parse(&connect_text).unwrap().unwrap();
                 assert_eq!(connect_frame.command, STOMPCommand::Connect);
 
-                // Reply CONNECTED
                 let connected = STOMPFrame::new(STOMPCommand::Connected)
                     .with_header("version", "1.2")
                     .with_header("session", format!("sess-{conn_id_num}"))
                     .with_header("heart-beat", "0,50");
                 tx.send(Message::text(connected.encode())).await.unwrap();
 
-                // Expect 3 SUBSCRIBE frames (public EAS, private EAS, PUID)
                 let sub_pub = STOMPFrame::parse(&rx.next().await.unwrap().unwrap().into_text().unwrap())
                     .unwrap()
                     .unwrap();
@@ -135,7 +130,6 @@ async fn stomp_client_subscribes_dedupes_and_recovers_4019() {
                 );
                 assert!(sub_puid.header("destination").unwrap().contains("productUserId/0002abcdef"));
 
-                // Send core.connect.v1.connected
                 let core_msg = STOMPFrame::new(STOMPCommand::Message).with_body(
                     json!({
                         "type": "core.connect.v1.connected",

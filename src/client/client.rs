@@ -539,7 +539,6 @@ impl Client {
                 Ok::<_, RustfnError>(())
             };
 
-            // Prepare build ID + clear any stale FN parties while EOS auth + STOMP connect run.
             let build_id_fut = async {
                 if warm_build_id {
                     let _ = self.ensure_party_build_id().await?;
@@ -1875,8 +1874,7 @@ impl Client {
     }
 }
 
-/// High-level session authentication controller bridging [`Auth`] with [`ClientConfig`],
-/// persistent device-auth storage, background token renewal, and [`ClientEventBus`] forwarding.
+/// Manages authentication, stored device credentials, and token renewal for a client.
 pub struct SessionAuth {
     manager: Arc<Auth>,
     device_store: Option<Arc<dyn DeviceAuthStore>>,
@@ -1894,12 +1892,15 @@ impl std::fmt::Debug for SessionAuth {
 }
 
 impl SessionAuth {
-    /// Creates a new [`SessionAuth`] backed by its own pooled [`HttpClient`].
     pub fn new(
         config: &ClientConfig,
         device_store: Option<Arc<dyn DeviceAuthStore>>,
     ) -> Result<Self, RustfnError> {
-        let resolved_store = resolve_device_store(config, device_store);
+        let resolved_store = device_store.or_else(|| {
+            config.device_auth_path.as_ref().map(|path| {
+                Arc::new(JsonFileDeviceAuthStore::new(path)) as Arc<dyn DeviceAuthStore>
+            })
+        });
         let auth_cfg = config.effective_auth_config(resolved_store.clone());
         let manager = Auth::new(auth_cfg, config.effective_http_config())?;
         Ok(Self {
@@ -2137,16 +2138,4 @@ fn should_sync_presence(
         ClientEvent::Disconnected => None,
         _ => Some(false),
     }
-}
-
-fn resolve_device_store(
-    config: &ClientConfig,
-    explicit: Option<Arc<dyn DeviceAuthStore>>,
-) -> Option<Arc<dyn DeviceAuthStore>> {
-    explicit.or_else(|| {
-        config
-            .device_auth_path
-            .as_ref()
-            .map(|path| Arc::new(JsonFileDeviceAuthStore::new(path)) as Arc<dyn DeviceAuthStore>)
-    })
 }

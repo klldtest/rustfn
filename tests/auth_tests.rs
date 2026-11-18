@@ -10,7 +10,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -614,5 +616,338 @@ async fn eos_external_auth_user_not_found_continues_auth_v1_users() {
     assert_eq!(
         tok.product_user_id.as_ref().map(|p| p.as_str()),
         Some("0002continuedpuid000000000000001")
+    );
+}
+
+#[tokio::test]
+async fn loop_skips_unexpired_fortnite_slot() {
+    let server = MockServer::start().await;
+    let account_id = "c8a41f92b0e347d19a5f32048e1bc672";
+    let puid = "00027b4d93e18c05f2a6419d3e80b517";
+    let long_expires = (Utc::now() + ChronoDuration::hours(4)).to_rfc3339();
+    let due_soon_expires = (Utc::now() + ChronoDuration::seconds(30)).to_rfc3339();
+    let refresh_expires = (Utc::now() + ChronoDuration::days(30)).to_rfc3339();
+
+    Mock::given(method("POST"))
+        .and(path("/account/api/oauth/token"))
+        .and(body_string_contains("grant_type=device_auth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "eg1~9c4e71b2a8034f5d9612e0b47c38a19f",
+            "expires_in": 14400,
+            "expires_at": long_expires,
+            "token_type": "bearer",
+            "refresh_token": "6f29a8d4e17c405b893d1c2e7a4f6091",
+            "refresh_expires": 2592000,
+            "refresh_expires_at": refresh_expires,
+            "account_id": account_id,
+            "client_id": AuthClient::FortniteAndroidGameClient.client_id(),
+            "internal_client": true,
+            "client_service": "fortnite",
+            "displayName": "q8m_4192",
+            "app": "fortnite",
+            "in_app_id": account_id,
+            "device_id": "4d91a0e8c3b247f18a6502d9e7c13b4a"
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/account/api/oauth/token"))
+        .and(body_string_contains("grant_type=client_credentials"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "eg1~2b8d50f194e34c72a16f8e90d35c471b",
+            "expires_in": 14400,
+            "expires_at": long_expires,
+            "token_type": "bearer",
+            "client_id": AuthClient::FortniteAndroidGameClient.client_id(),
+            "internal_client": true,
+            "client_service": "fortnite",
+            "product_id": "prod-fn",
+            "application_id": "app-fn"
+        })))
+        .mount(&server)
+        .await;
+
+    let fn_refresh_calls = Arc::new(AtomicUsize::new(0));
+    let fn_refresh_calls_clone = Arc::clone(&fn_refresh_calls);
+    Mock::given(method("POST"))
+        .and(path("/account/api/oauth/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(move |_: &wiremock::Request| {
+            fn_refresh_calls_clone.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(500).set_body_string("should not refresh non-due Fortnite slot")
+        })
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/account/api/oauth/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "expiresInSeconds": 300,
+            "code": "a91c4e728b0f4d36a59e1c7820d4b3f6",
+            "creatingClientId": AuthClient::FortniteAndroidGameClient.client_id()
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/epic/oauth/v2/token"))
+        .and(body_string_contains("grant_type=exchange_code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.d49f",
+            "token_type": "bearer",
+            "expires_in": 30,
+            "expires_at": due_soon_expires,
+            "refresh_token": "e48c21a9f0b743d29c6a15e8d04b729a",
+            "refresh_expires_at": refresh_expires,
+            "account_id": account_id,
+            "product_user_id": puid,
+            "client_id": AuthClient::FortniteAndroidGameClient.client_id(),
+            "deployment_id": "62a9473a2dca46b29ccf17577fcf42d7",
+            "merged_accounts": [],
+            "scope": "basic_profile friends_list presence openid"
+        })))
+        .mount(&server)
+        .await;
+
+    let eos_refresh_calls = Arc::new(AtomicUsize::new(0));
+    let eos_refresh_calls_clone = Arc::clone(&eos_refresh_calls);
+    Mock::given(method("POST"))
+        .and(path("/epic/oauth/v2/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(move |_: &wiremock::Request| {
+            eos_refresh_calls_clone.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.f73b",
+                "token_type": "bearer",
+                "expires_in": 3600,
+                "expires_at": long_expires,
+                "refresh_token": "9b17e4c60d8a42f391b5c0e7a28d4613",
+                "refresh_expires_at": refresh_expires,
+                "account_id": account_id,
+                "product_user_id": puid,
+                "client_id": AuthClient::FortniteAndroidGameClient.client_id(),
+                "deployment_id": "62a9473a2dca46b29ccf17577fcf42d7",
+                "merged_accounts": [],
+                "scope": "basic_profile friends_list presence openid"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let auth = Auth::new(
+        AuthConfig {
+            endpoints: mock_endpoints(&server),
+            check_eula: false,
+            kill_other_tokens: false,
+            refresh_lead_time: Duration::from_secs(300),
+            ..AuthConfig::default()
+        },
+        HttpClientConfig::default(),
+    )
+    .unwrap();
+
+    let creds = DeviceAuthCredentials::new(
+        AccountId::parse(account_id).unwrap(),
+        "4d91a0e8c3b247f18a6502d9e7c13b4a",
+        SecretString::from("b83c91e4f20a4d7c8615b9e307a24f68"),
+    );
+    auth.authenticate(AuthMethod::DeviceAuth(creds)).await.unwrap();
+
+    let cancel = CancellationToken::new();
+    let refresh_loop = auth.spawn_refresh_loop(cancel);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    refresh_loop.stop().await;
+
+    assert_eq!(
+        eos_refresh_calls.load(Ordering::SeqCst),
+        1,
+        "only the due FortniteEos slot should refresh once"
+    );
+    assert_eq!(
+        fn_refresh_calls.load(Ordering::SeqCst),
+        0,
+        "Fortnite slot with 4h remaining must not be refreshed"
+    );
+}
+
+#[tokio::test]
+async fn fortnite_refresh_fallback_device_auth() {
+    let server = MockServer::start().await;
+    let account_id = "f3b9204c8d1e4a79b6520e38c14a9d73";
+    let expires = (Utc::now() + ChronoDuration::hours(4)).to_rfc3339();
+    let refresh_expires = (Utc::now() + ChronoDuration::days(30)).to_rfc3339();
+
+    let device_auth_calls = Arc::new(AtomicUsize::new(0));
+    let device_auth_calls_clone = Arc::clone(&device_auth_calls);
+    let da_expires = expires.clone();
+    let da_refresh_expires = refresh_expires.clone();
+    Mock::given(method("POST"))
+        .and(path("/account/api/oauth/token"))
+        .and(body_string_contains("grant_type=device_auth"))
+        .respond_with(move |_: &wiremock::Request| {
+            let n = device_auth_calls_clone.fetch_add(1, Ordering::SeqCst) + 1;
+            ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": format!("eg1~5a7c19e4b2084d6f_{n}"),
+                "expires_in": 14400,
+                "expires_at": da_expires,
+                "token_type": "bearer",
+                "refresh_token": format!("3d82f6a109c44e7b_{n}"),
+                "refresh_expires": 2592000,
+                "refresh_expires_at": da_refresh_expires,
+                "account_id": account_id,
+                "client_id": AuthClient::FortniteAndroidGameClient.client_id(),
+                "internal_client": true,
+                "client_service": "fortnite",
+                "displayName": "x3r_7058",
+                "app": "fortnite",
+                "in_app_id": account_id,
+                "device_id": "9a04d2c7e18f4b36a519d7e2c80b4f13"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/account/api/oauth/token"))
+        .and(body_string_contains("grant_type=client_credentials"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "eg1~7e12a94c5b0348f6d219c8e40a7b3f52",
+            "expires_in": 14400,
+            "expires_at": expires,
+            "token_type": "bearer",
+            "client_id": AuthClient::FortniteAndroidGameClient.client_id(),
+            "internal_client": true,
+            "client_service": "fortnite",
+            "product_id": "prod-fn",
+            "application_id": "app-fn"
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/account/api/oauth/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "errorCode": "errors.com.epicgames.account.auth_token.invalid_refresh_token",
+            "errorMessage": "Sorry the refresh token '3d82f6a109c44e7b_1' is invalid. Reason: TOKEN_NOT_FOUND"
+        })))
+        .mount(&server)
+        .await;
+
+    let auth = Auth::new(
+        AuthConfig {
+            endpoints: mock_endpoints(&server),
+            check_eula: false,
+            kill_other_tokens: false,
+            create_eos_session: false,
+            ..AuthConfig::default()
+        },
+        HttpClientConfig::default(),
+    )
+    .unwrap();
+
+    let creds = DeviceAuthCredentials::new(
+        AccountId::parse(account_id).unwrap(),
+        "9a04d2c7e18f4b36a519d7e2c80b4f13",
+        SecretString::from("6c18f4a9e30247d5b920c4e817a3f65d"),
+    );
+    auth.authenticate(AuthMethod::DeviceAuth(creds)).await.unwrap();
+
+    let summary = auth
+        .refresh_slot(AuthSessionSlot::Fortnite)
+        .await
+        .expect("DeviceAuth fallback should recover from TOKEN_NOT_FOUND");
+    assert_eq!(device_auth_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(summary.slot, AuthSessionSlot::Fortnite);
+}
+
+#[tokio::test]
+async fn invalid_refresh_token_stops_retrying() {
+    let server = MockServer::start().await;
+    let account_id = "7a1d84e90c3b46f28e51a7c934d0f26b";
+    let due_soon_expires = (Utc::now() + ChronoDuration::seconds(30)).to_rfc3339();
+    let long_expires = (Utc::now() + ChronoDuration::hours(4)).to_rfc3339();
+    let refresh_expires = (Utc::now() + ChronoDuration::days(30)).to_rfc3339();
+
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_calls_clone = Arc::clone(&refresh_calls);
+    Mock::given(method("POST"))
+        .and(path("/account/api/oauth/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(move |_: &wiremock::Request| {
+            let n = refresh_calls_clone.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": "eg1~8d3a41c7e0b942f5961c2a8e47b0d531",
+                    "expires_in": 30,
+                    "expires_at": due_soon_expires,
+                    "token_type": "bearer",
+                    "refresh_token": "2f90b4c8e1a647d39c58e2b704a9f163",
+                    "refresh_expires": 2592000,
+                    "refresh_expires_at": refresh_expires,
+                    "account_id": account_id,
+                    "client_id": AuthClient::FortniteAndroidGameClient.client_id(),
+                    "internal_client": true,
+                    "client_service": "fortnite",
+                    "displayName": "n6k_2941",
+                    "app": "fortnite",
+                    "in_app_id": account_id
+                }))
+            } else {
+                ResponseTemplate::new(400).set_body_json(json!({
+                    "errorCode": "errors.com.epicgames.account.auth_token.invalid_refresh_token",
+                    "errorMessage": "Sorry the refresh token '2f90b4c8e1a647d39c58e2b704a9f163' is invalid. Reason: TOKEN_NOT_FOUND"
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/account/api/oauth/token"))
+        .and(body_string_contains("grant_type=client_credentials"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "eg1~4e61c9b207a84f3d8529e1c47b0a63f8",
+            "expires_in": 14400,
+            "expires_at": long_expires,
+            "token_type": "bearer",
+            "client_id": AuthClient::FortniteAndroidGameClient.client_id(),
+            "internal_client": true,
+            "client_service": "fortnite",
+            "product_id": "prod-fn",
+            "application_id": "app-fn"
+        })))
+        .mount(&server)
+        .await;
+
+    let auth = Auth::new(
+        AuthConfig {
+            endpoints: mock_endpoints(&server),
+            check_eula: false,
+            kill_other_tokens: false,
+            create_eos_session: false,
+            refresh_lead_time: Duration::from_secs(300),
+            ..AuthConfig::default()
+        },
+        HttpClientConfig::default(),
+    )
+    .unwrap();
+
+    auth.authenticate(AuthMethod::RefreshToken(SecretString::from(
+        "9c0e7b31a4824d5f8b61e9c2047a3f85",
+    )))
+    .await
+    .unwrap();
+
+    let cancel = CancellationToken::new();
+    let refresh_loop = auth.spawn_refresh_loop(cancel);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    refresh_loop.stop().await;
+
+    assert_eq!(
+        refresh_calls.load(Ordering::SeqCst),
+        2,
+        "1 bootstrap + 1 failed refresh; slot must park rather than spin"
     );
 }

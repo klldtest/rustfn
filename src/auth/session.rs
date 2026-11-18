@@ -101,7 +101,6 @@ pub struct DeviceCodeInitResponse {
     pub client_id: Option<String>,
 }
 
-/// Active OAuth credential state retained per session slot.
 #[derive(Debug, Clone)]
 pub struct StoredAuthSession {
     pub slot: AuthSessionSlot,
@@ -137,7 +136,6 @@ impl StoredAuthSession {
     }
 }
 
-/// Secret-free diagnostic snapshot of an active OAuth session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthSessionSummary {
     pub slot: AuthSessionSlot,
@@ -149,39 +147,18 @@ pub struct AuthSessionSummary {
     pub product_user_id: Option<ProductUserId>,
 }
 
-/// Thread-safe session registry guarded by per-slot single-flight refresh mutexes.
 #[derive(Debug)]
 pub struct AuthSessionStore {
     sessions: RwLock<HashMap<AuthSessionSlot, StoredAuthSession>>,
-    refresh_gates: RefreshGates,
+    refresh_gates: [Arc<Mutex<()>>; 4],
 }
 
-#[derive(Debug)]
-struct RefreshGates {
-    fortnite: Arc<Mutex<()>>,
-    launcher: Arc<Mutex<()>>,
-    fortnite_client_credentials: Arc<Mutex<()>>,
-    fortnite_eos: Arc<Mutex<()>>,
-}
-
-impl RefreshGates {
-    fn new() -> Self {
-        Self {
-            fortnite: Arc::new(Mutex::new(())),
-            launcher: Arc::new(Mutex::new(())),
-            fortnite_client_credentials: Arc::new(Mutex::new(())),
-            fortnite_eos: Arc::new(Mutex::new(())),
-        }
-    }
-
-    fn get(&self, slot: AuthSessionSlot) -> Arc<Mutex<()>> {
-        let gate = match slot {
-            AuthSessionSlot::Fortnite => &self.fortnite,
-            AuthSessionSlot::Launcher => &self.launcher,
-            AuthSessionSlot::FortniteClientCredentials => &self.fortnite_client_credentials,
-            AuthSessionSlot::FortniteEos => &self.fortnite_eos,
-        };
-        Arc::clone(gate)
+fn slot_index(slot: AuthSessionSlot) -> usize {
+    match slot {
+        AuthSessionSlot::Fortnite => 0,
+        AuthSessionSlot::Launcher => 1,
+        AuthSessionSlot::FortniteClientCredentials => 2,
+        AuthSessionSlot::FortniteEos => 3,
     }
 }
 
@@ -195,19 +172,16 @@ impl AuthSessionStore {
     pub fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
-            refresh_gates: RefreshGates::new(),
+            refresh_gates: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
         }
     }
 
     pub fn refresh_gate(&self, slot: AuthSessionSlot) -> Arc<Mutex<()>> {
-        self.refresh_gates.get(slot)
+        Arc::clone(&self.refresh_gates[slot_index(slot)])
     }
 
     pub async fn get_session(&self, slot: AuthSessionSlot) -> Option<StoredAuthSession> {
-        let gate = self.refresh_gate(slot);
-        let _guard = gate.lock().await;
-        drop(_guard);
-
+        let _ = self.refresh_gate(slot).lock().await;
         self.sessions.read().await.get(&slot).cloned()
     }
 
@@ -282,14 +256,10 @@ pub fn deserialize_secret_string<'de, D: Deserializer<'de>>(
 pub fn deserialize_opt_secret_string<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<SecretString>, D::Error> {
-    let opt = Option::<String>::deserialize(deserializer)?;
-    Ok(opt.map(|s| {
-        let zeroed = Zeroizing::new(s);
-        SecretString::from(zeroed.as_str())
-    }))
+    Ok(Option::<String>::deserialize(deserializer)?
+        .map(|s| SecretString::from(Zeroizing::new(s).as_str())))
 }
 
-/// Persistent DeviceAuth credentials usable for unattended Epic OAuth logins.
 #[derive(Clone, Deserialize)]
 pub struct DeviceAuthCredentials {
     #[serde(alias = "accountId")]

@@ -577,8 +577,10 @@ async fn spawn_test_party_with_keepalive(
         members: Vec::new(),
     };
 
-    let mut party_config = PartyConfig::default();
-    party_config.eos_keep_alive_interval = keepalive_interval;
+    let party_config = PartyConfig {
+        eos_keep_alive_interval: keepalive_interval,
+        ..Default::default()
+    };
 
     let party = ClientParty::spawn(ClientPartyInit {
         self_id: self_id.clone(),

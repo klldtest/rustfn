@@ -264,9 +264,7 @@ impl PartyChat {
         self.chat_enabled
     }
 
-    /// Sends a signed party chat message to all other party members.
-    ///
-    /// Fails on single-member parties with no other recipients or when `PartyConfig::chat_enabled` is false.
+    /// Sends to other members; fails if chat is disabled or the party has no recipients.
     pub async fn send(&self, content: &str) -> Result<PartyChatMessage, RustfnError> {
         if !self.chat_enabled {
             return Err(RustfnError::PartyState(
@@ -658,10 +656,7 @@ impl PartyState {
         Some((promoted, self.snapshot.clone()))
     }
 
-    /// Reconciles an XMPP `MEMBER_JOINED` or `MEMBER_STATE_UPDATED` delta.
-    ///
-    /// If the target member has not yet arrived via STOMP `party.v2.MEMBER_JOINED`, pushes the
-    /// delta into `metadata_store` for ordered replay once STOMP creates the slot.
+    /// Buffers XMPP deltas until STOMP has created the member slot.
     pub fn apply_xmpp_member_delta(
         &mut self,
         msg: XMPPPartyMemberDeltaNotification,

@@ -198,35 +198,28 @@ async fn xmpp_client_handshake_admin_messages_and_bounded_retries() {
                 // Connection 0 succeeds full RFC 7395 handshake, sends 1 admin stanza, then drops pings.
                 // Subsequent connections reject auth to exercise strictly bounded retry counter (< max_retries).
                 if conn_idx == 0 {
-                    // Wait initial <open>
                     let _ = rx.next().await;
                     tx.send(Message::text("<open xmlns='urn:ietf:params:xml:ns:xmpp-framing' id='s1' from='prod.ol.epicgames.com'/>")).await.unwrap();
                     tx.send(Message::text("<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>PLAIN</mechanism></mechanisms></stream:features>")).await.unwrap();
 
-                    // Read SASL <auth>
                     let auth_msg = rx.next().await.unwrap().unwrap().into_text().unwrap();
                     assert!(auth_msg.contains("mechanism='PLAIN'"));
                     tx.send(Message::text("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")).await.unwrap();
 
-                    // Read restart <open>
                     let _ = rx.next().await;
                     tx.send(Message::text("<open xmlns='urn:ietf:params:xml:ns:xmpp-framing' id='s2' from='prod.ol.epicgames.com'/>")).await.unwrap();
                     tx.send(Message::text("<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>")).await.unwrap();
 
-                    // Read bind IQ
                     let bind_req = rx.next().await.unwrap().unwrap().into_text().unwrap();
                     assert!(bind_req.contains("id='bind_1'"));
                     tx.send(Message::text("<iq type='result' id='bind_1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>aaaa1111bbbb2222cccc3333dddd4444@prod.ol.epicgames.com/V2:Fortnite:WIN::TEST</jid></bind></iq>")).await.unwrap();
 
-                    // Read session IQ
                     let sess_req = rx.next().await.unwrap().unwrap().into_text().unwrap();
                     assert!(sess_req.contains("id='sess_1'"));
                     tx.send(Message::text("<iq type='result' id='sess_1'/>")).await.unwrap();
 
-                    // Wait initial <presence>
                     let _ = rx.next().await;
 
-                    // Send admin notification
                     let payload = json!({
                         "type": "USER_BLOCKLIST_UPDATE",
                         "accountId": "bbbb1111cccc2222dddd3333eeee4444",
@@ -274,8 +267,8 @@ async fn xmpp_client_handshake_admin_messages_and_bounded_retries() {
     let mut saw_exhausted = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(250), events.recv()).await {
-            Ok(Ok(ev)) => match &*ev {
+        if let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(250), events.recv()).await {
+            match &*ev {
                 XMPPEvent::AdminMessage(XMPPAdminMessage::UserBlocklistUpdate(upd)) => {
                     assert_eq!(upd.status, "BLOCKED");
                     saw_admin = true;
@@ -286,8 +279,7 @@ async fn xmpp_client_handshake_admin_messages_and_bounded_retries() {
                     break;
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
     }
 

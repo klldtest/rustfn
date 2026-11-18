@@ -255,8 +255,10 @@ async fn register_public_key_parses_live_epic_schema() {
     let client = HttpClient::new(fast_test_http_config())
         .unwrap()
         .with_token_provider(provider);
-    let mut endpoints = ServiceEndpoints::default();
-    endpoints.publickey = format!("{}/publickey", server.uri()).into();
+    let endpoints = ServiceEndpoints {
+        publickey: format!("{}/publickey", server.uri()).into(),
+        ..Default::default()
+    };
     let api = HTTP::new(client, endpoints, ExtraServiceEndpoints::default());
 
     let parsed: PublicKeyResponse = api
@@ -285,8 +287,10 @@ async fn send_eos_conversation_message_accepts_204_empty_body() {
     let client = HttpClient::new(fast_test_http_config())
         .unwrap()
         .with_token_provider(provider);
-    let mut endpoints = ServiceEndpoints::default();
-    endpoints.eos_chat = format!("{}/epic/chat", server.uri()).into();
+    let endpoints = ServiceEndpoints {
+        eos_chat: format!("{}/epic/chat", server.uri()).into(),
+        ..Default::default()
+    };
     let api = HTTP::new(client, endpoints, ExtraServiceEndpoints::default());
 
     let req = ChatSendMessageRequest {

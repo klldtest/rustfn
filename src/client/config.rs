@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Top-level configuration for a single [`crate::client::client::Client`] session.
+/// Top-level configuration for a [`crate::client::Client`] session.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub platform: Platform,
@@ -93,10 +93,8 @@ impl Default for ClientConfig {
 }
 
 impl ClientConfig {
-    /// Builds the effective [`HttpClientConfig`] incorporating top-level language, user-agent, and retry overrides.
     pub fn effective_http_config(&self) -> HttpClientConfig {
         let default_http = HttpClientConfig::default();
-        let default_retry = RetryConfig::default();
         let mut cfg = self.http.clone();
 
         if self.http.user_agent == default_http.user_agent
@@ -107,13 +105,12 @@ impl ClientConfig {
         if self.http.accept_language == default_http.accept_language && self.language != "en" {
             cfg.accept_language = self.language.clone();
         }
-        if retry_eq(&self.http.retry, &default_retry) && !retry_eq(&self.retry, &default_retry) {
+        if self.http.retry == RetryConfig::default() && self.retry != self.http.retry {
             cfg.retry = self.retry.clone();
         }
         cfg
     }
 
-    /// Builds the effective [`XMPPConfig`] synchronized with configured endpoints, platform, and metadata TTL.
     pub fn effective_xmpp_config(&self) -> XMPPConfig {
         let def = XMPPConfig::default();
         let mut cfg = self.xmpp.clone();
@@ -130,7 +127,6 @@ impl ClientConfig {
         cfg
     }
 
-    /// Builds the effective [`STOMPConfig`] synchronized with configured endpoints and deployment ID.
     pub fn effective_stomp_config(&self) -> STOMPConfig {
         let def = STOMPConfig::default();
         let mut cfg = self.stomp.clone();
@@ -143,7 +139,6 @@ impl ClientConfig {
         cfg
     }
 
-    /// Builds [`AuthConfig`] derived from this client configuration and optional persistent device store.
     pub fn effective_auth_config(&self, device_store: Option<Arc<dyn DeviceAuthStore>>) -> AuthConfig {
         AuthConfig {
             auth_client: self.game_auth_client,
@@ -158,18 +153,4 @@ impl ClientConfig {
             device_store,
         }
     }
-}
-
-fn retry_eq(a: &RetryConfig, b: &RetryConfig) -> bool {
-    a.max_retry_attempts == b.max_retry_attempts
-        && a.rest_retry_limit == b.rest_retry_limit
-        && a.max_wait_time == b.max_wait_time
-        && a.max_retry_after == b.max_retry_after
-        && a.backoff_start == b.backoff_start
-        && a.backoff_factor.to_bits() == b.backoff_factor.to_bits()
-        && a.backoff_cap == b.backoff_cap
-        && a.retry_after_padding == b.retry_after_padding
-        && a.handle_rate_limits == b.handle_rate_limits
-        && a.handle_capacity_throttling == b.handle_capacity_throttling
-        && a.other_requests_wait == b.other_requests_wait
 }

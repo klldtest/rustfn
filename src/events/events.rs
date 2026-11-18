@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
-/// High-level client, social, presence, party, and chat events emitted by a session.
+/// Client, social, presence, party, and chat events.
 #[derive(Debug, Clone)]
 pub enum ClientEvent {
     Ready {
@@ -145,7 +145,7 @@ pub trait EventHandler: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
-/// Broadcast bus distributing immutable event snapshots to concurrent subscribers.
+/// Broadcast bus for client events.
 #[derive(Clone)]
 pub struct ClientEventBus {
     sender: broadcast::Sender<Arc<ClientEvent>>,
@@ -173,23 +173,13 @@ impl ClientEventBus {
         handler: Arc<H>,
         cancel: CancellationToken,
     ) -> JoinHandle<()> {
-        let mut rx = self.subscribe();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    recv = rx.recv() => {
-                        match recv {
-                            Ok(event) => handler.handle(event).await,
-                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                tracing::warn!(skipped, "client event subscriber lagged behind broadcast buffer");
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                }
-            }
-        })
+        self.spawn_fn(
+            move |event| {
+                let handler = Arc::clone(&handler);
+                async move { handler.handle(event).await }
+            },
+            cancel,
+        )
     }
 
     pub fn spawn_fn<F, Fut>(
@@ -206,14 +196,12 @@ impl ClientEventBus {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
-                    recv = rx.recv() => {
-                        match recv {
-                            Ok(event) => handler(event).await,
-                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                tracing::warn!(skipped, "client event subscriber lagged behind broadcast buffer");
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
+                    recv = rx.recv() => match recv {
+                        Ok(event) => handler(event).await,
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!(skipped, "client event subscriber lagged behind broadcast buffer");
                         }
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }
@@ -329,7 +317,21 @@ impl PartyEventSink for ClientEventBus {
     }
 }
 
-/// Shared session dependencies inspected when translating inbound XMPP and STOMP frames into state updates.
+impl From<FriendTransition> for ClientEvent {
+    fn from(transition: FriendTransition) -> Self {
+        match transition {
+            FriendTransition::Added(friend) => Self::FriendAdded(friend),
+            FriendTransition::RequestAccepted(friend) => Self::FriendRequestAccepted(friend),
+            FriendTransition::RequestReceived(pending) => Self::FriendRequestReceived(pending),
+            FriendTransition::Removed(friend) => Self::FriendRemoved(friend),
+            FriendTransition::RequestCancelled(pending) => Self::FriendRequestCancelled(pending),
+            FriendTransition::RequestDeclined(pending) => Self::FriendRequestDeclined(pending),
+            FriendTransition::Blocked(user) => Self::BlockedUserAdded(user),
+            FriendTransition::Unblocked(account_id) => Self::BlockedUserRemoved(account_id),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RealtimeEventContext {
     pub self_id: AccountId,
@@ -344,23 +346,44 @@ pub struct RealtimeEventContext {
     pub presence_permission: PresencePermission,
 }
 
-/// Spawns the XMPP WebSocket event dispatcher under `cancel`.
-///
-/// The caller must pass `rx = xmpp.subscribe_events()` captured prior to `xmpp.connect`
-/// so early server admin/presence stanzas are never missed.
-pub fn spawn_xmpp_event_handler(
+impl RealtimeEventContext {
+    async fn party_for_fn(&self, party_id: &PartyId) -> Option<ClientParty> {
+        self.party_slot
+            .read()
+            .await
+            .clone()
+            .filter(|p| p.fn_id().as_str() == party_id.as_str())
+    }
+
+    async fn party_for_eos(&self, party_id: &PartyId) -> Option<ClientParty> {
+        self.party_slot
+            .read()
+            .await
+            .clone()
+            .filter(|p| p.eos_id() == party_id)
+    }
+}
+
+fn spawn_event_loop<T, F, Fut>(
     ctx: RealtimeEventContext,
-    mut rx: broadcast::Receiver<Arc<XMPPEvent>>,
+    mut rx: broadcast::Receiver<Arc<T>>,
     cancel: CancellationToken,
-) -> JoinHandle<()> {
+    label: &'static str,
+    mut handle: F,
+) -> JoinHandle<()>
+where
+    T: Clone + Send + Sync + 'static,
+    F: FnMut(RealtimeEventContext, T) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 recv = rx.recv() => match recv {
-                    Ok(event) => handle_xmpp_event(&ctx, (*event).clone()).await,
+                    Ok(event) => handle(ctx.clone(), (*event).clone()).await,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(account_id = %ctx.self_id, skipped, "XMPP handler lagged behind broadcast buffer");
+                        warn!(account_id = %ctx.self_id, skipped, "{label} handler lagged behind broadcast buffer");
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -369,28 +392,25 @@ pub fn spawn_xmpp_event_handler(
     })
 }
 
-/// Spawns the EOS Connect STOMP event dispatcher under `cancel`.
-///
-/// The caller must pass `rx = stomp.subscribe_events()` captured prior to `stomp.connect`
-/// so immediate `presence.v1`, `social.chat.v1`, and `party.v2` pushes are never dropped.
-pub fn spawn_stomp_event_handler(
+/// Spawns the XMPP event dispatcher (`rx` must be subscribed prior to `xmpp.connect`).
+pub fn spawn_xmpp_event_handler(
     ctx: RealtimeEventContext,
-    mut rx: broadcast::Receiver<Arc<STOMPEvent>>,
+    rx: broadcast::Receiver<Arc<XMPPEvent>>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                recv = rx.recv() => match recv {
-                    Ok(event) => handle_stomp_event(&ctx, (*event).clone()).await,
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(account_id = %ctx.self_id, skipped, "STOMP handler lagged behind broadcast buffer");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
+    spawn_event_loop(ctx, rx, cancel, "XMPP", |ctx, ev| async move {
+        handle_xmpp_event(&ctx, ev).await;
+    })
+}
+
+/// Spawns the EOS STOMP event dispatcher (`rx` must be subscribed prior to `stomp.connect`).
+pub fn spawn_stomp_event_handler(
+    ctx: RealtimeEventContext,
+    rx: broadcast::Receiver<Arc<STOMPEvent>>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    spawn_event_loop(ctx, rx, cancel, "STOMP", |ctx, ev| async move {
+        handle_stomp_event(&ctx, ev).await;
     })
 }
 
@@ -452,24 +472,16 @@ async fn handle_xmpp_event(ctx: &RealtimeEventContext, event: XMPPEvent) {
                 return;
             }
 
-            let online_type = if presence_type.as_deref() == Some("unavailable") {
-                PresenceOnlineType::Offline
-            } else {
-                match show.as_deref() {
-                    Some("away") => PresenceOnlineType::Away,
-                    Some("xa") => PresenceOnlineType::Xa,
-                    Some("dnd") => PresenceOnlineType::Dnd,
-                    Some("chat") => PresenceOnlineType::Chat,
-                    _ => PresenceOnlineType::Online,
-                }
+            let (mut online_type, away_status) = match show.as_deref() {
+                Some("away") => (PresenceOnlineType::Away, AwayStatus::Away),
+                Some("xa") => (PresenceOnlineType::Xa, AwayStatus::ExtendedAway),
+                Some("dnd") => (PresenceOnlineType::Dnd, AwayStatus::DoNotDisturb),
+                Some("chat") => (PresenceOnlineType::Chat, AwayStatus::Chat),
+                _ => (PresenceOnlineType::Online, AwayStatus::Online),
             };
-            let away_status = match show.as_deref() {
-                Some("away") => AwayStatus::Away,
-                Some("xa") => AwayStatus::ExtendedAway,
-                Some("dnd") => AwayStatus::DoNotDisturb,
-                Some("chat") => AwayStatus::Chat,
-                _ => AwayStatus::Online,
-            };
+            if presence_type.as_deref() == Some("unavailable") {
+                online_type = PresenceOnlineType::Offline;
+            }
 
             let parsed_status = status
                 .as_deref()
@@ -497,34 +509,31 @@ async fn handle_xmpp_event(ctx: &RealtimeEventContext, event: XMPPEvent) {
 async fn handle_xmpp_admin_message(ctx: &RealtimeEventContext, admin: XMPPAdminMessage) {
     match admin {
         XMPPAdminMessage::FriendUpdate(notif) => {
-            if let Some(transition) = ctx.friends.on_friend_notification(&notif).await {
-                emit_friend_transition(&ctx.events, transition);
+            if let Some(t) = ctx.friends.on_friend_notification(&notif).await {
+                ctx.events.emit(t.into());
             }
         }
         XMPPAdminMessage::FriendshipRemove(notif) => {
-            if let Some(transition) = ctx.friends.on_friendship_remove(&notif) {
-                emit_friend_transition(&ctx.events, transition);
+            if let Some(t) = ctx.friends.on_friendship_remove(&notif) {
+                ctx.events.emit(t.into());
             }
         }
         XMPPAdminMessage::UserBlocklistUpdate(notif) => {
-            if let Some(transition) = ctx.friends.on_blocklist_update(&notif).await {
-                emit_friend_transition(&ctx.events, transition);
+            if let Some(t) = ctx.friends.on_blocklist_update(&notif).await {
+                ctx.events.emit(t.into());
             }
         }
         XMPPAdminMessage::BlockListEntryAdded(payload) => {
-            let transition = ctx.friends.on_legacy_blocklist_entry(true, &payload).await;
-            emit_friend_transition(&ctx.events, transition);
+            ctx.events
+                .emit(ctx.friends.on_legacy_blocklist_entry(true, &payload).await.into());
         }
         XMPPAdminMessage::BlockListEntryRemoved(payload) => {
-            let transition = ctx.friends.on_legacy_blocklist_entry(false, &payload).await;
-            emit_friend_transition(&ctx.events, transition);
+            ctx.events
+                .emit(ctx.friends.on_legacy_blocklist_entry(false, &payload).await.into());
         }
         XMPPAdminMessage::PartyMemberJoined(delta)
         | XMPPAdminMessage::PartyMemberStateUpdated(delta) => {
-            let active_party = ctx.party_slot.read().await.clone();
-            if let Some(party) = active_party
-                && party.fn_id().as_str() == delta.party_id.as_str()
-            {
+            if let Some(party) = ctx.party_for_fn(&delta.party_id).await {
                 if let Err(err) = party.handle_xmpp_member_delta(delta).await {
                     debug!(error = %err, "failed to apply XMPP party member delta");
                 }
@@ -534,18 +543,14 @@ async fn handle_xmpp_admin_message(ctx: &RealtimeEventContext, admin: XMPPAdminM
             }
         }
         XMPPAdminMessage::PartyUpdated(msg) => {
-            let active_party = ctx.party_slot.read().await.clone();
-            if let Some(party) = active_party
-                && party.fn_id().as_str() == msg.party_id.as_str()
+            if let Some(party) = ctx.party_for_fn(&msg.party_id).await
                 && let Err(err) = party.handle_xmpp_party_updated(msg).await
             {
                 debug!(error = %err, "failed to apply XMPP party update");
             }
         }
         XMPPAdminMessage::PartyMemberRequireConfirmation(msg) => {
-            let active_party = ctx.party_slot.read().await.clone();
-            if let Some(party) = active_party
-                && party.fn_id().as_str() == msg.party_id.as_str()
+            if let Some(party) = ctx.party_for_fn(&msg.party_id).await
                 && let Err(err) = party.handle_xmpp_confirmation(msg).await
             {
                 debug!(error = %err, "failed to process XMPP party confirmation");
@@ -760,10 +765,7 @@ async fn handle_stomp_notification(
                 .emit(ClientEvent::PartyJoinRequestReceived(request));
         }
         EOSConnectNotification::PartyMemberJoined { payload, .. } => {
-            let active_party = ctx.party_slot.read().await.clone();
-            if let Some(party) = active_party
-                && party.eos_id() == &payload.party_id
-            {
+            if let Some(party) = ctx.party_for_eos(&payload.party_id).await {
                 if let Err(err) = party.handle_stomp_member_joined(payload).await {
                     debug!(error = %err, "failed to process STOMP MEMBER_JOINED");
                 }
@@ -783,9 +785,7 @@ async fn handle_stomp_notification(
             handle_stomp_party_disbanded(ctx, payload.party_id).await;
         }
         EOSConnectNotification::PartyMemberDisconnected { payload, .. } => {
-            let active_party = ctx.party_slot.read().await.clone();
-            if let Some(party) = active_party
-                && party.eos_id() == &payload.party_id
+            if let Some(party) = ctx.party_for_eos(&payload.party_id).await
                 && let Some(snap) = party.snapshot().await
                 && let Some(member) = snap.member(&payload.account_id).cloned()
             {
@@ -796,10 +796,7 @@ async fn handle_stomp_notification(
             }
         }
         EOSConnectNotification::PartyUpdated { payload, .. } => {
-            let active_party = ctx.party_slot.read().await.clone();
-            if let Some(party) = active_party
-                && party.eos_id() == &payload.party_id
-            {
+            if let Some(party) = ctx.party_for_eos(&payload.party_id).await {
                 if let Err(err) = party.handle_stomp_party_updated(payload).await {
                     debug!(error = %err, "failed to process STOMP PARTY_UPDATED");
                 }
@@ -829,13 +826,9 @@ async fn handle_stomp_member_removal(
     payload: EOSPartyMemberUpdateData,
     reason: MemberRemovalReason,
 ) {
-    let active_party = ctx.party_slot.read().await.clone();
-    let Some(party) = active_party else {
+    let Some(party) = ctx.party_for_eos(&payload.party_id).await else {
         return;
     };
-    if party.eos_id() != &payload.party_id {
-        return;
-    }
     let was_self = payload.account_id == ctx.self_id;
     let eos_id = payload.party_id.clone();
 
@@ -896,37 +889,19 @@ async fn sync_eos_internal_presence(ctx: &RealtimeEventContext) {
     }
 }
 
-fn emit_friend_transition(bus: &ClientEventBus, transition: FriendTransition) {
-    let event = match transition {
-        FriendTransition::Added(friend) => ClientEvent::FriendAdded(friend),
-        FriendTransition::RequestAccepted(friend) => ClientEvent::FriendRequestAccepted(friend),
-        FriendTransition::RequestReceived(pending) => ClientEvent::FriendRequestReceived(pending),
-        FriendTransition::Removed(friend) => ClientEvent::FriendRemoved(friend),
-        FriendTransition::RequestCancelled(pending) => ClientEvent::FriendRequestCancelled(pending),
-        FriendTransition::RequestDeclined(pending) => ClientEvent::FriendRequestDeclined(pending),
-        FriendTransition::Blocked(user) => ClientEvent::BlockedUserAdded(user),
-        FriendTransition::Unblocked(account_id) => ClientEvent::BlockedUserRemoved(account_id),
-    };
-    bus.emit(event);
-}
-
 async fn resolve_display_name(
     ctx: &RealtimeEventContext,
     account_id: &AccountId,
     fallback: Option<String>,
 ) -> Option<String> {
-    if let Some(friend) = ctx.friends.get(account_id)
-        && friend.display_name.is_some()
-    {
-        return friend.display_name;
+    if let Some(name) = ctx.friends.get(account_id).and_then(|friend| friend.display_name) {
+        return Some(name);
     }
-    if let Some(cached) = ctx.users.get_cached(account_id)
-        && cached.display_name.is_some()
-    {
-        return cached.display_name;
+    if let Some(name) = ctx.users.get_cached(account_id).and_then(|user| user.display_name) {
+        return Some(name);
     }
-    if fallback.is_some() {
-        return fallback;
+    if let Some(name) = fallback {
+        return Some(name);
     }
     ctx.users
         .fetch(account_id)

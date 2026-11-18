@@ -17,11 +17,13 @@ use crate::protocol::{
     ServiceEndpoints,
 };
 use secrecy::{ExposeSecret, SecretString};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, RwLock, broadcast};
+use tokio::time::Instant;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -202,13 +204,19 @@ pub struct AuthTokenCoordinator {
     store: Arc<AuthSessionStore>,
     event_tx: broadcast::Sender<AuthEvent>,
     wake_scheduler: Arc<Notify>,
+    device_auth: RwLock<Option<(AuthClient, DeviceAuthCredentials)>>,
 }
 
 impl AuthTokenCoordinator {
+    async fn set_device_auth(&self, client: AuthClient, creds: DeviceAuthCredentials) {
+        *self.device_auth.write().await = Some((client, creds));
+    }
+
     async fn refresh_slot_internal(
         &self,
         slot: AuthSessionSlot,
-        expected_failed_token: Option<&str>,
+        failed_token: Option<&str>,
+        wake_loop: bool,
     ) -> Result<StoredAuthSession, RustfnError> {
         let gate = self.store.refresh_gate(slot);
         let _guard = gate.lock().await;
@@ -217,7 +225,7 @@ impl AuthTokenCoordinator {
             RustfnError::Auth(format!("cannot refresh missing session slot {slot:?}"))
         })?;
 
-        if let Some(failed) = expected_failed_token
+        if let Some(failed) = failed_token
             && current.access_token.expose_secret() != failed
         {
             return Ok(current);
@@ -228,23 +236,50 @@ impl AuthTokenCoordinator {
                 let refresh_token = current.refresh_token.as_ref().ok_or_else(|| {
                     RustfnError::Auth(format!("slot {slot:?} has no refresh token"))
                 })?;
-                let resp = grant_refresh_token(
+                match grant_refresh_token(
                     &self.http_raw,
                     &self.endpoints,
                     current.client,
                     refresh_token,
                 )
-                .await?;
-                let updated = epic_response_to_stored(slot, current.client, resp);
-                if slot == AuthSessionSlot::Launcher
-                    && let Some(rt) = updated.refresh_token.as_ref()
+                .await
                 {
-                    let _ = self.event_tx.send(AuthEvent::LauncherRefreshTokenCreated {
-                        account_id: updated.account_id.clone(),
-                        refresh_token: rt.expose_secret().to_owned(),
-                    });
+                    Ok(resp) => {
+                        let updated = epic_response_to_stored(slot, current.client, resp);
+                        if slot == AuthSessionSlot::Launcher
+                            && let Some(rt) = updated.refresh_token.as_ref()
+                        {
+                            let _ = self.event_tx.send(AuthEvent::LauncherRefreshTokenCreated {
+                                account_id: updated.account_id.clone(),
+                                refresh_token: rt.expose_secret().to_owned(),
+                            });
+                        }
+                        updated
+                    }
+                    Err(err)
+                        if slot == AuthSessionSlot::Fortnite
+                            && (err.is_invalid_refresh_token() || err.is_invalid_token()) =>
+                    {
+                        if let Some((client, creds)) = self.device_auth.read().await.clone() {
+                            debug!(
+                                account_id = %creds.account_id,
+                                error = %err,
+                                "Fortnite refresh token invalid; re-authenticating via DeviceAuth"
+                            );
+                            let resp = grant_device_auth(
+                                &self.http_raw,
+                                &self.endpoints,
+                                client,
+                                &creds,
+                            )
+                            .await?;
+                            epic_response_to_stored(slot, client, resp)
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                    Err(err) => return Err(err),
                 }
-                updated
             }
             AuthSessionSlot::FortniteClientCredentials => {
                 let resp =
@@ -255,15 +290,40 @@ impl AuthTokenCoordinator {
                 let refresh_token = current.refresh_token.as_ref().ok_or_else(|| {
                     RustfnError::Auth("EOS session has no refresh token".to_owned())
                 })?;
-                let resp = refresh_eos_token(
+                match refresh_eos_token(
                     &self.http_raw,
                     &self.endpoints,
                     current.client,
                     refresh_token,
                     &current.eos_base_payload,
                 )
-                .await?;
-                eos_response_to_stored(current.client, resp, current.eos_base_payload)
+                .await
+                {
+                    Ok(resp) => {
+                        eos_response_to_stored(current.client, resp, current.eos_base_payload)
+                    }
+                    Err(err) if err.is_invalid_refresh_token() || err.is_invalid_token() => {
+                        let fn_token = self.store.bearer_secret(AuthSessionSlot::Fortnite).await?;
+                        let deployment_id = current
+                            .eos_base_payload
+                            .get("deployment_id")
+                            .cloned()
+                            .unwrap_or_else(|| EOS_EAS_DEPLOYMENT_ID.to_owned());
+                        let exchange =
+                            create_exchange_code(&self.http_raw, &self.endpoints, &fn_token)
+                                .await?;
+                        let eos_resp = authenticate_eos_exchange(
+                            &self.http_raw,
+                            &self.endpoints,
+                            current.client,
+                            &exchange.code,
+                            &deployment_id,
+                        )
+                        .await?;
+                        eos_response_to_stored(current.client, eos_resp, current.eos_base_payload)
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         };
 
@@ -272,7 +332,9 @@ impl AuthTokenCoordinator {
             slot,
             summary: refreshed.summary(),
         });
-        self.wake_scheduler.notify_one();
+        if wake_loop {
+            self.wake_scheduler.notify_one();
+        }
         Ok(refreshed)
     }
 }
@@ -288,7 +350,7 @@ impl TokenProvider for AuthTokenCoordinator {
         failed_token: &'a str,
     ) -> BoxFuture<'a, Result<SecretString, RustfnError>> {
         Box::pin(async move {
-            match self.refresh_slot_internal(slot, Some(failed_token)).await {
+            match self.refresh_slot_internal(slot, Some(failed_token), true).await {
                 Ok(session) => Ok(session.access_token),
                 Err(err) => {
                     let _ = self.event_tx.send(AuthEvent::RefreshFailed {
@@ -335,6 +397,7 @@ impl Auth {
             store: Arc::clone(&store),
             event_tx: event_tx.clone(),
             wake_scheduler: Arc::clone(&wake_scheduler),
+            device_auth: RwLock::new(None),
         });
 
         let provider: Arc<dyn TokenProvider> = Arc::clone(&coordinator) as Arc<dyn TokenProvider>;
@@ -428,7 +491,7 @@ impl Auth {
             .and_then(|cfg| cfg.ios_client)
             .unwrap_or(self.config.auth_client);
 
-        match method {
+        let (session_client, fortnite_resp) = match method {
             AuthMethod::DeviceAuth(creds) => {
                 let resp = grant_device_auth(
                     &self.http_raw,
@@ -437,13 +500,10 @@ impl Auth {
                     &creds,
                 )
                 .await?;
-                self.store
-                    .insert_session(epic_response_to_stored(
-                        AuthSessionSlot::Fortnite,
-                        self.config.auth_client,
-                        resp,
-                    ))
+                self.coordinator
+                    .set_device_auth(self.config.auth_client, creds)
                     .await;
+                (self.config.auth_client, resp)
             }
             AuthMethod::AuthorizationCode(input) => {
                 let code = extract_authorization_code(&input)?;
@@ -454,13 +514,7 @@ impl Auth {
                     &code,
                 )
                 .await?;
-                self.store
-                    .insert_session(epic_response_to_stored(
-                        AuthSessionSlot::Fortnite,
-                        self.config.auth_client,
-                        resp,
-                    ))
-                    .await;
+                (self.config.auth_client, resp)
             }
             AuthMethod::ExchangeCode(raw_code) => {
                 let code = SecretString::from(raw_code.trim());
@@ -471,13 +525,7 @@ impl Auth {
                     &code,
                 )
                 .await?;
-                self.store
-                    .insert_session(epic_response_to_stored(
-                        AuthSessionSlot::Fortnite,
-                        self.config.auth_client,
-                        resp,
-                    ))
-                    .await;
+                (self.config.auth_client, resp)
             }
             AuthMethod::RefreshToken(rt) => {
                 let resp = grant_refresh_token(
@@ -487,13 +535,7 @@ impl Auth {
                     &rt,
                 )
                 .await?;
-                self.store
-                    .insert_session(epic_response_to_stored(
-                        AuthSessionSlot::Fortnite,
-                        self.config.auth_client,
-                        resp,
-                    ))
-                    .await;
+                (self.config.auth_client, resp)
             }
             AuthMethod::LauncherRefreshToken(rt) => {
                 let launcher_resp = grant_refresh_token(
@@ -516,20 +558,14 @@ impl Auth {
                 .await?;
                 self.store.insert_session(launcher_session).await;
 
-                let fn_resp = grant_exchange_code(
+                let resp = grant_exchange_code(
                     &self.http_raw,
                     &self.config.endpoints,
                     self.config.auth_client,
                     &exchange.code,
                 )
                 .await?;
-                self.store
-                    .insert_session(epic_response_to_stored(
-                        AuthSessionSlot::Fortnite,
-                        self.config.auth_client,
-                        fn_resp,
-                    ))
-                    .await;
+                (self.config.auth_client, resp)
             }
             AuthMethod::DeviceCode | AuthMethod::DeviceCodeAuth(_) => {
                 let cfg = device_code_cfg.unwrap_or_else(DeviceCodeAuth::headless);
@@ -551,29 +587,21 @@ impl Auth {
                     },
                 )
                 .await?;
-                self.store
-                    .insert_session(epic_response_to_stored(
-                        AuthSessionSlot::Fortnite,
-                        effective_client,
-                        resp,
-                    ))
-                    .await;
+                (effective_client, resp)
             }
-        }
+        };
 
-        let fortnite_session = self
-            .store
-            .get_session_unguarded(AuthSessionSlot::Fortnite)
-            .await
-            .ok_or_else(|| RustfnError::Auth("Fortnite session missing after login".to_owned()))?;
+        let fortnite_session =
+            epic_response_to_stored(AuthSessionSlot::Fortnite, session_client, fortnite_resp);
+        self.store.insert_session(fortnite_session.clone()).await;
 
-        if let Some(tx) = hooks.on_fortnite.take() {
-            if let Some(account_id) = fortnite_session.account_id.clone() {
-                let _ = tx.send(FortniteSessionInfo {
-                    account_id,
-                    display_name: fortnite_session.display_name.clone(),
-                });
-            }
+        if let Some(tx) = hooks.on_fortnite.take()
+            && let Some(account_id) = fortnite_session.account_id.clone()
+        {
+            let _ = tx.send(FortniteSessionInfo {
+                account_id,
+                display_name: fortnite_session.display_name.clone(),
+            });
         }
 
         if !is_launcher_rt && self.config.create_launcher_session {
@@ -649,6 +677,9 @@ impl Auth {
                 if let Some(store) = self.config.device_store.as_ref() {
                     store.save(&creds).await?;
                 }
+                self.coordinator
+                    .set_device_auth(effective_client, creds.clone())
+                    .await;
                 let _ = self.event_tx.send(AuthEvent::DeviceAuthCreated(creds));
             }
             Ok::<_, RustfnError>(())
@@ -759,7 +790,7 @@ impl Auth {
         slot: AuthSessionSlot,
     ) -> Result<AuthSessionSummary, RustfnError> {
         self.coordinator
-            .refresh_slot_internal(slot, None)
+            .refresh_slot_internal(slot, None, true)
             .await
             .map(|s| s.summary())
     }
@@ -770,7 +801,7 @@ impl Auth {
 
         for session in snapshots {
             let slot = session.slot;
-            if let Err(err) = self.coordinator.refresh_slot_internal(slot, None).await {
+            if let Err(err) = self.coordinator.refresh_slot_internal(slot, None, false).await {
                 warn!(?slot, error = %err, "Failed to refresh auth slot");
                 let _ = self.event_tx.send(AuthEvent::RefreshFailed {
                     slot,
@@ -785,6 +816,60 @@ impl Auth {
         match first_err {
             Some(err) => Err(err),
             None => Ok(()),
+        }
+    }
+
+    async fn refresh_sessions(
+        &self,
+        lead_time: Duration,
+        force: bool,
+        backoff: &mut HashMap<AuthSessionSlot, Backoff>,
+    ) {
+        let now = Utc::now();
+        let tick = Instant::now();
+        let snapshots = self.store.all_snapshots().await;
+
+        for session in snapshots {
+            let slot = session.slot;
+            if !force {
+                if let Some(state) = backoff.get(&slot) {
+                    if state.skip_expiry == Some(session.expires_at) {
+                        continue;
+                    }
+                    if state.retry_at > tick {
+                        continue;
+                    }
+                }
+                let remaining = (session.expires_at - now)
+                    .to_std()
+                    .unwrap_or(Duration::ZERO);
+                if remaining > lead_time {
+                    continue;
+                }
+            }
+
+            match self.coordinator.refresh_slot_internal(slot, None, false).await {
+                Ok(_) => {
+                    backoff.remove(&slot);
+                }
+                Err(err) => {
+                    warn!(?slot, error = %err, "Failed to refresh auth slot");
+                    let _ = self.event_tx.send(AuthEvent::RefreshFailed {
+                        slot,
+                        error: err.to_string(),
+                    });
+                    let entry = backoff.entry(slot).or_default();
+                    if err.is_invalid_refresh_token() {
+                        entry.skip_expiry = Some(session.expires_at);
+                    } else {
+                        entry.failures = entry.failures.saturating_add(1);
+                        let secs = 10u64
+                            .saturating_mul(1u64 << entry.failures.saturating_sub(1).min(5))
+                            .min(300);
+                        entry.retry_at = Instant::now() + Duration::from_secs(secs);
+                    }
+                }
+            }
         }
     }
 
@@ -872,10 +957,11 @@ fn epic_response_to_stored(
     }
 }
 
-/// Schedules proactive token renewals ahead of the earliest expiring active session.
+/// Refreshes active sessions before they expire.
 pub struct TokenRefreshLoop {
     cancel: CancellationToken,
     wake: Arc<Notify>,
+    force_refresh: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -888,18 +974,22 @@ impl TokenRefreshLoop {
     ) -> Self {
         let loop_cancel = cancel.clone();
         let loop_wake = Arc::clone(&wake);
+        let force_refresh = Arc::new(AtomicBool::new(false));
+        let loop_force = Arc::clone(&force_refresh);
         let handle = tokio::spawn(async move {
-            run_loop(auth, loop_wake, loop_cancel, lead_time).await;
+            run_loop(auth, loop_wake, loop_force, loop_cancel, lead_time).await;
         });
 
         Self {
             cancel,
             wake,
+            force_refresh,
             handle: Some(handle),
         }
     }
 
     pub fn trigger_now(&self) {
+        self.force_refresh.store(true, Ordering::Release);
         self.wake.notify_one();
     }
 
@@ -917,63 +1007,93 @@ impl Drop for TokenRefreshLoop {
     }
 }
 
+#[derive(Debug, Clone)]
+struct Backoff {
+    failures: u32,
+    retry_at: Instant,
+    skip_expiry: Option<DateTime<Utc>>,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self {
+            failures: 0,
+            retry_at: Instant::now(),
+            skip_expiry: None,
+        }
+    }
+}
+
 async fn run_loop(
     weak_auth: Weak<Auth>,
     wake: Arc<Notify>,
+    force: Arc<AtomicBool>,
     cancel: CancellationToken,
     lead_time: Duration,
 ) {
-    // Discard any wakeup permit stored before the loop started (for example right at initial login).
+    // Drop stale permit left by initial login.
     tokio::select! {
         biased;
         _ = wake.notified() => {}
         _ = std::future::ready(()) => {}
     }
 
+    let mut backoff: HashMap<AuthSessionSlot, Backoff> = HashMap::new();
+
     loop {
         let Some(auth) = weak_auth.upgrade() else {
             return;
         };
 
-        let sleep_dur = compute_next_sleep(&auth, lead_time).await;
+        let delay = next_timeout(&auth, lead_time, &backoff).await;
         drop(auth);
 
-        debug!(sleep_secs = sleep_dur.as_secs_f64(), "Auth refresh timer armed");
+        debug!(sleep_secs = delay.as_secs_f64(), "Auth refresh timer armed");
 
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = wake.notified() => {
                 debug!("Auth refresh woken explicitly");
             }
-            _ = tokio::time::sleep(sleep_dur) => {}
+            _ = tokio::time::sleep(delay) => {}
         }
 
         let Some(auth) = weak_auth.upgrade() else {
             return;
         };
-        if let Err(err) = auth.refresh_all().await {
-            warn!(error = %err, "Scheduled token refresh encountered an error");
-        }
+        let forced = force.swap(false, Ordering::AcqRel);
+        auth.refresh_sessions(lead_time, forced, &mut backoff).await;
     }
 }
 
-async fn compute_next_sleep(auth: &Auth, lead_time: Duration) -> Duration {
+async fn next_timeout(
+    auth: &Auth,
+    lead_time: Duration,
+    backoff: &HashMap<AuthSessionSlot, Backoff>,
+) -> Duration {
+    let now = Utc::now();
+    let tick = Instant::now();
     let snapshots = auth.store().all_snapshots().await;
-    let earliest: Option<DateTime<Utc>> = snapshots.into_iter().map(|s| s.expires_at).min();
 
-    let Some(earliest_expiry) = earliest else {
-        return Duration::from_secs(300);
-    };
-
-    let remaining = (earliest_expiry - Utc::now())
-        .to_std()
-        .unwrap_or(Duration::ZERO);
-
-    if remaining > lead_time {
-        remaining - lead_time
-    } else if remaining > Duration::from_secs(10) {
-        remaining / 2
-    } else {
-        Duration::from_secs(1)
+    let mut min_wait: Option<Duration> = None;
+    for session in snapshots {
+        let state = backoff.get(&session.slot);
+        if state.is_some_and(|s| s.skip_expiry == Some(session.expires_at)) {
+            continue;
+        }
+        let remaining = (session.expires_at - now)
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        let wait_exp = remaining.saturating_sub(lead_time);
+        let wait_err = state
+            .map(|s| s.retry_at.saturating_duration_since(tick))
+            .unwrap_or(Duration::ZERO);
+        let wait = wait_exp.max(wait_err);
+        min_wait = Some(match min_wait {
+            Some(cur) => cur.min(wait),
+            None => wait,
+        });
     }
+
+    min_wait.unwrap_or(Duration::from_secs(300))
 }

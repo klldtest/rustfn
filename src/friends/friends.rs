@@ -19,7 +19,6 @@ use std::sync::Arc;
 const ERR_FRIEND_NOT_FOUND: &str = "errors.com.epicgames.friends.friend_not_found";
 const ERR_ACCOUNT_NOT_FOUND: &str = "errors.com.epicgames.account.account_not_found";
 
-/// Direction of a pending Epic friendship request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum FriendDirection {
@@ -27,7 +26,6 @@ pub enum FriendDirection {
     Outbound,
 }
 
-/// Active accepted friend entry enriched with display name, alias, note, and mutual count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FriendRecord {
     pub id: AccountId,
@@ -48,7 +46,6 @@ impl FriendRecord {
     }
 }
 
-/// Incoming or outgoing pending friend request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingFriend {
     pub id: AccountId,
@@ -59,7 +56,6 @@ pub struct PendingFriend {
     pub created_at: Option<String>,
 }
 
-/// Blocked Epic Games account entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockedUser {
     pub id: AccountId,
@@ -67,7 +63,6 @@ pub struct BlockedUser {
     pub created_at: Option<String>,
 }
 
-/// Point-in-time snapshot of all social roster lists.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FriendSummarySnapshot {
     pub friends: Vec<FriendRecord>,
@@ -120,7 +115,7 @@ struct FortBasicInfoProp {
     home_base_rating: Option<i32>,
 }
 
-/// Unified parsed presence snapshot across XMPP and EOS Connect STOMP updates.
+/// Friend presence from XMPP or EOS Connect.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FriendPresence {
     pub account_id: AccountId,
@@ -244,60 +239,36 @@ impl FriendPresence {
     }
 
     fn apply_raw_props(&mut self, props: &BTreeMap<String, Value>) {
-        if let Some(join_val) = props
-            .get("party.joininfodata.286331153")
-            .or_else(|| props.get(PARTY_JOIN_INFO_PROP_KEY))
+        let prop = |a, b| props.get(a).or_else(|| props.get(b));
+
+        if let Some(join_val) = prop("party.joininfodata.286331153", PARTY_JOIN_INFO_PROP_KEY)
+            && let Ok(mut parsed) = serde_json::from_value::<PartyJoinInfoData>(join_val.clone())
         {
-            if let Ok(mut parsed) = serde_json::from_value::<PartyJoinInfoData>(join_val.clone()) {
-                if parsed.source_display_name.is_none() {
-                    parsed.source_display_name = join_val
-                        .get("sDN")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                }
-                if parsed.source_platform.is_none() {
-                    parsed.source_platform = join_val
-                        .get("sP")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                }
-                if parsed.party_id.is_none()
-                    && let Some(pid) = join_val.get("p").and_then(Value::as_str)
-                {
-                    parsed.party_id = Some(pid.to_owned());
-                }
-                if parsed.build_id.is_none() {
-                    parsed.build_id = join_val
-                        .get("b")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                }
-                if parsed.not_accepting_members_reason.is_none() {
-                    parsed.not_accepting_members_reason =
-                        join_val.get("nAR").and_then(Value::as_i64);
-                }
-                if parsed.pc.is_none() {
-                    parsed.pc = join_val
-                        .get("pc")
-                        .and_then(Value::as_u64)
-                        .map(|n| n as u32);
-                }
-                if let Some(ref plat) = parsed.source_platform {
-                    self.platform = parse_platform_loose(plat);
-                }
-                let is_private = join_val
-                    .get("bIsPrivate")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if !is_private || parsed.party_id.is_some() {
-                    self.party_join_info = Some(parsed);
-                }
+            let str_field = |k| join_val.get(k).and_then(Value::as_str).map(ToOwned::to_owned);
+            parsed.source_display_name = parsed.source_display_name.or_else(|| str_field("sDN"));
+            parsed.source_platform = parsed.source_platform.or_else(|| str_field("sP"));
+            parsed.party_id = parsed.party_id.or_else(|| str_field("p"));
+            parsed.build_id = parsed.build_id.or_else(|| str_field("b"));
+            parsed.not_accepting_members_reason = parsed
+                .not_accepting_members_reason
+                .or_else(|| join_val.get("nAR").and_then(Value::as_i64));
+            parsed.pc = parsed
+                .pc
+                .or_else(|| join_val.get("pc").and_then(Value::as_u64).map(|n| n as u32));
+
+            if let Some(ref plat) = parsed.source_platform {
+                self.platform = parse_platform_loose(plat);
+            }
+            let is_private = join_val
+                .get("bIsPrivate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !is_private || parsed.party_id.is_some() {
+                self.party_join_info = Some(parsed);
             }
         }
 
-        if let Some(basic) = props
-            .get("FortBasicInfo")
-            .or_else(|| props.get("FortBasicInfo_j"))
+        if let Some(basic) = prop("FortBasicInfo", "FortBasicInfo_j")
             && let Ok(parsed) = serde_json::from_value::<FortBasicInfoProp>(basic.clone())
             && self.platform.is_none()
             && let Some(ref plat) = parsed.source_platform
@@ -305,34 +276,18 @@ impl FriendPresence {
             self.platform = parse_platform_loose(plat);
         }
 
-        self.party_size = props
-            .get("FortPartySize")
-            .or_else(|| props.get("FortPartySize_i"))
-            .and_then(Value::as_i64);
-        self.sub_game = props
-            .get("FortSubGame")
-            .or_else(|| props.get("FortSubGame_s"))
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                Value::Number(n) => n.to_string(),
-                other => other.to_string(),
-            });
-        self.island_code = props
-            .get("IslandCode")
-            .or_else(|| props.get("IslandCode_s"))
+        self.party_size = prop("FortPartySize", "FortPartySize_i").and_then(Value::as_i64);
+        self.sub_game = prop("FortSubGame", "FortSubGame_s").map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        });
+        self.island_code = prop("IslandCode", "IslandCode_s")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        self.is_in_zone = props
-            .get("IsInZone")
-            .or_else(|| props.get("IsInZone_b"))
-            .and_then(Value::as_bool);
-        self.in_unjoinable_match = props
-            .get("InUnjoinableMatch")
-            .or_else(|| props.get("InUnjoinableMatch_b"))
-            .and_then(Value::as_bool);
-        self.social_status = props
-            .get("SocialStatus")
-            .or_else(|| props.get("SocialStatus_s"))
+        self.is_in_zone = prop("IsInZone", "IsInZone_b").and_then(Value::as_bool);
+        self.in_unjoinable_match =
+            prop("InUnjoinableMatch", "InUnjoinableMatch_b").and_then(Value::as_bool);
+        self.social_status = prop("SocialStatus", "SocialStatus_s")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
     }
@@ -532,7 +487,7 @@ fn parse_platform_loose(raw: &str) -> Option<Platform> {
     serde_json::from_value(Value::String(raw.trim().to_owned())).ok()
 }
 
-/// Social event transitions computed when reconciling real-time notifications into [`FriendManager`].
+/// Friend state changes produced by realtime notifications.
 #[derive(Debug, Clone)]
 pub enum FriendTransition {
     Added(FriendRecord),
@@ -545,7 +500,7 @@ pub enum FriendTransition {
     Unblocked(AccountId),
 }
 
-/// Concurrent friend list, pending request, blocklist, and presence history manager.
+/// Friend, request, blocklist, and presence state.
 pub struct FriendManager {
     self_id: AccountId,
     http: HTTP,
@@ -578,8 +533,7 @@ impl FriendManager {
         })
     }
 
-    /// Synchronizes full friend roster, pending requests, and blocklist from `/friends/api/v1/{id}/summary`,
-    /// enriching all distinct accounts with batched user display names.
+    /// Loads friends, requests, and blocked users with their display names.
     pub async fn sync_summary(&self) -> Result<FriendSummarySnapshot, RustfnError> {
         let summary: FriendsSummaryResponse = self.http.fetch_friends_summary(&self.self_id).await?;
 
@@ -603,11 +557,7 @@ impl FriendManager {
             }
         }
 
-        let profiles = if all_ids.is_empty() {
-            Vec::new()
-        } else {
-            self.users.fetch_multiple(&all_ids).await?
-        };
+        let profiles = self.users.fetch_multiple(&all_ids).await?;
         let profile_map: std::collections::HashMap<AccountId, Option<String>> = profiles
             .into_iter()
             .map(|p| (p.id, p.display_name))
@@ -619,15 +569,12 @@ impl FriendManager {
         self.blocked.clear();
 
         let mut snapshot = FriendSummarySnapshot::default();
+        let dn = |id: &AccountId| profile_map.get(id).cloned().flatten();
 
         for item in summary.friends {
-            let display_name = profile_map
-                .get(&item.account_id)
-                .cloned()
-                .flatten();
             let rec = FriendRecord {
                 id: item.account_id.clone(),
-                display_name,
+                display_name: dn(&item.account_id),
                 alias: item.alias.filter(|a| !a.is_empty()),
                 note: item.note.filter(|n| !n.is_empty()),
                 mutual_count: item.mutual,
@@ -640,13 +587,9 @@ impl FriendManager {
         }
 
         for item in summary.incoming {
-            let display_name = profile_map
-                .get(&item.account_id)
-                .cloned()
-                .flatten();
             let pending = PendingFriend {
                 id: item.account_id.clone(),
-                display_name,
+                display_name: dn(&item.account_id),
                 direction: FriendDirection::Inbound,
                 mutual_count: item.mutual,
                 favorite: item.favorite.unwrap_or(false),
@@ -657,13 +600,9 @@ impl FriendManager {
         }
 
         for item in summary.outgoing {
-            let display_name = profile_map
-                .get(&item.account_id)
-                .cloned()
-                .flatten();
             let pending = PendingFriend {
                 id: item.account_id.clone(),
-                display_name,
+                display_name: dn(&item.account_id),
                 direction: FriendDirection::Outbound,
                 mutual_count: item.mutual,
                 favorite: item.favorite.unwrap_or(false),
@@ -674,13 +613,9 @@ impl FriendManager {
         }
 
         for item in summary.blocklist {
-            let display_name = profile_map
-                .get(&item.account_id)
-                .cloned()
-                .flatten();
             let blocked = BlockedUser {
                 id: item.account_id.clone(),
-                display_name,
+                display_name: dn(&item.account_id),
                 created_at: item.created,
             };
             self.blocked.insert(item.account_id, blocked.clone());
@@ -921,23 +856,8 @@ impl FriendManager {
         notif: &XMPPUserBlocklistUpdate,
     ) -> Option<FriendTransition> {
         match notif.status.as_str() {
-            "BLOCKED" => {
-                self.friends.remove(&notif.account_id);
-                self.incoming.remove(&notif.account_id);
-                self.outgoing.remove(&notif.account_id);
-                let display_name = self.resolve_cached_display_name(&notif.account_id).await;
-                let entry = BlockedUser {
-                    id: notif.account_id.clone(),
-                    display_name,
-                    created_at: None,
-                };
-                self.blocked.insert(notif.account_id.clone(), entry.clone());
-                Some(FriendTransition::Blocked(entry))
-            }
-            "UNBLOCKED" => {
-                self.blocked.remove(&notif.account_id);
-                Some(FriendTransition::Unblocked(notif.account_id.clone()))
-            }
+            "BLOCKED" => Some(self.apply_block(&notif.account_id, true).await),
+            "UNBLOCKED" => Some(self.apply_block(&notif.account_id, false).await),
             _ => None,
         }
     }
@@ -947,22 +867,25 @@ impl FriendManager {
         added: bool,
         payload: &XMPPBlockListEntryPayload,
     ) -> FriendTransition {
-        if added {
-            self.friends.remove(&payload.account_id);
-            self.incoming.remove(&payload.account_id);
-            self.outgoing.remove(&payload.account_id);
-            let display_name = self.resolve_cached_display_name(&payload.account_id).await;
-            let entry = BlockedUser {
-                id: payload.account_id.clone(),
-                display_name,
-                created_at: None,
-            };
-            self.blocked.insert(payload.account_id.clone(), entry.clone());
-            FriendTransition::Blocked(entry)
-        } else {
-            self.blocked.remove(&payload.account_id);
-            FriendTransition::Unblocked(payload.account_id.clone())
+        self.apply_block(&payload.account_id, added).await
+    }
+
+    async fn apply_block(&self, account_id: &AccountId, blocked: bool) -> FriendTransition {
+        if !blocked {
+            self.blocked.remove(account_id);
+            return FriendTransition::Unblocked(account_id.clone());
         }
+        self.friends.remove(account_id);
+        self.incoming.remove(account_id);
+        self.outgoing.remove(account_id);
+        let display_name = self.resolve_cached_display_name(account_id).await;
+        let entry = BlockedUser {
+            id: account_id.clone(),
+            display_name,
+            created_at: None,
+        };
+        self.blocked.insert(account_id.clone(), entry.clone());
+        FriendTransition::Blocked(entry)
     }
 
     pub fn record_presence(&self, presence: FriendPresence) {
@@ -978,10 +901,8 @@ impl FriendManager {
     }
 
     async fn resolve_cached_display_name(&self, account_id: &AccountId) -> Option<String> {
-        if let Some(cached) = self.users.get_cached(account_id)
-            && cached.display_name.is_some()
-        {
-            return cached.display_name;
+        if let Some(name) = self.users.get_cached(account_id).and_then(|user| user.display_name) {
+            return Some(name);
         }
         self.users
             .fetch(account_id)

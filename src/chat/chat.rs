@@ -1,8 +1,3 @@
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use chrono::{DateTime, Utc};
-use dashmap::DashMap;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand_core::{OsRng, RngCore};
 use crate::friends::FriendManager;
 use crate::http::{
     ChatMessageMetadata, ChatSendMessageBody, ChatSendMessageRequest, HTTP,
@@ -10,6 +5,11 @@ use crate::http::{
 };
 use crate::protocol::{AccountId, PartyId, Platform, RustfnError};
 use crate::xmpp::{XMPP, chat_message_frame};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -101,13 +101,7 @@ impl SignedChatKeypair {
     pub fn generate() -> Self {
         let mut secret = [0u8; 32];
         OsRng.fill_bytes(&mut secret);
-        let signing_key = SigningKey::from_bytes(&secret);
-        let public_key_b64 = BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes());
-        Self {
-            signing_key,
-            public_key_b64,
-            registration: None,
-        }
+        Self::from_secret_bytes(&secret)
     }
 
     pub fn from_secret_bytes(secret: &[u8; 32]) -> Self {
@@ -147,12 +141,7 @@ impl SignedChatKeypair {
                 .await?;
             return Ok(self.registration.insert(registered));
         }
-        match self.registration.as_ref() {
-            Some(reg) => Ok(reg),
-            None => Err(RustfnError::Protocol(
-                "public key registration missing".to_owned(),
-            )),
-        }
+        Ok(self.registration.as_ref().expect("just verified registered"))
     }
 
     /// Signs `base64(json_payload) || 0x00` with the session's Ed25519 private key.
@@ -242,15 +231,8 @@ pub fn verify_signed_message(
         .map_err(|err| RustfnError::Protocol(format!("Ed25519 signature verification failed: {err}")))
 }
 
-/// Decodes Epic Connect STOMP chat message bodies.
-///
-/// Base64-encoded JSON payloads unwrap `.msg`; plain base64 UTF-8 payloads trim trailing NULs;
-/// unencoded legacy strings pass through cleanly.
+/// Decodes base64 chat bodies, preserving unencoded legacy messages.
 pub fn decode_stomp_message_body(raw_body: &str) -> String {
-    if raw_body.is_empty() {
-        return String::new();
-    }
-
     let Ok(decoded_bytes) = BASE64_STANDARD.decode(raw_body.trim()) else {
         return raw_body.to_owned();
     };
@@ -272,8 +254,8 @@ mod tests {
         ChatSignedType, SignedChatKeypair, decode_stomp_message_body, verify_signed_message,
     };
     use crate::http::PublicKeyResponse;
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use crate::protocol::AccountId;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use serde_json::Value;
 
     #[test]
@@ -469,51 +451,51 @@ impl ChatManager {
                 )
             };
 
-        let is_reportable = is_reportable_hint.unwrap_or(default_reportable);
+        let mut reportable = is_reportable_hint.unwrap_or(default_reportable);
         let allowed_recipients: Vec<AccountId> = recipient_ids
             .iter()
             .filter(|id| *id != &self.self_id)
             .cloned()
             .collect();
 
-        match self
-            .post_party_message(
+        let msg_id = match self
+            .send_signed_message(
                 &scope,
                 &addressed_conv,
                 &signed_conv,
                 chat_type,
-                &allowed_recipients,
-                is_reportable,
+                1,
+                allowed_recipients.clone(),
+                reportable,
+                Some("1".to_owned()),
                 content,
             )
             .await
         {
-            Ok(msg_id) => Ok(SentPartyChatResult {
-                message_id: msg_id,
-                conversation_id: addressed_conv,
-                resolved_is_reportable: is_reportable,
-            }),
+            Ok(msg_id) => msg_id,
             Err(err) if is_reportable_mismatch(&err) => {
-                let expected = is_reportable_expected(&err).unwrap_or(!is_reportable);
-                let msg_id = self
-                    .post_party_message(
-                        &scope,
-                        &addressed_conv,
-                        &signed_conv,
-                        chat_type,
-                        &allowed_recipients,
-                        expected,
-                        content,
-                    )
-                    .await?;
-                Ok(SentPartyChatResult {
-                    message_id: msg_id,
-                    conversation_id: addressed_conv,
-                    resolved_is_reportable: expected,
-                })
+                reportable = is_reportable_expected(&err).unwrap_or(!reportable);
+                self.send_signed_message(
+                    &scope,
+                    &addressed_conv,
+                    &signed_conv,
+                    chat_type,
+                    1,
+                    allowed_recipients,
+                    reportable,
+                    Some("1".to_owned()),
+                    content,
+                )
+                .await?
             }
-            Err(err) => Err(err),
-        }
+            Err(err) => return Err(err),
+        };
+
+        Ok(SentPartyChatResult {
+            message_id: msg_id,
+            conversation_id: addressed_conv,
+            resolved_is_reportable: reportable,
+        })
     }
 
     /// Sends a lightweight EOS whisper (`POST /epic/chat/v1/public/{ns}/whispers/{sender}/{recipient}`).
@@ -576,33 +558,23 @@ impl ChatManager {
         entry: &DmConversationEntry,
         content: &str,
     ) -> Result<SentFriendMessage, RustfnError> {
-        let signed = self
-            .sign_with_registered_key(&entry.conversation_id, content, ChatSignedType::Persistent, 0)
-            .await?;
-
-        let request = ChatSendMessageRequest {
-            allowed_recipients: vec![recipient_id.clone(), self.self_id.clone()],
-            message: ChatSendMessageBody {
-                body: signed.body_base64,
-            },
-            is_reportable: entry.is_reportable,
-            metadata: ChatMessageMetadata {
-                tm_v: "2".to_owned(),
-                pub_jwt: signed.pub_jwt,
-                sig: signed.signature_base64,
-                npm: None,
-                plf_nm: self.platform.as_str().to_owned(),
-                plf_id: self.self_id.as_str().to_owned(),
-            },
-        };
-
-        let resp = self
-            .http
-            .send_eos_conversation_message("_", &entry.conversation_id, &self.self_id, &request)
+        let allowed = vec![recipient_id.clone(), self.self_id.clone()];
+        let message_id = self
+            .send_signed_message(
+                "_",
+                &entry.conversation_id,
+                &entry.conversation_id,
+                ChatSignedType::Persistent,
+                0,
+                allowed,
+                entry.is_reportable,
+                None,
+                content,
+            )
             .await?;
 
         Ok(SentFriendMessage {
-            message_id: resp.message_id.unwrap_or(signed.message_id),
+            message_id,
             recipient_id: recipient_id.clone(),
             conversation_id: entry.conversation_id.clone(),
             content: content.to_owned(),
@@ -611,22 +583,24 @@ impl ChatManager {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn post_party_message(
+    async fn send_signed_message(
         &self,
         scope: &str,
         addressed_conv: &str,
         signed_conv: &str,
         chat_type: ChatSignedType,
-        allowed_recipients: &[AccountId],
+        sequence: u64,
+        allowed_recipients: Vec<AccountId>,
         is_reportable: bool,
+        npm: Option<String>,
         content: &str,
     ) -> Result<String, RustfnError> {
         let signed = self
-            .sign_with_registered_key(signed_conv, content, chat_type, 1)
+            .sign_with_registered_key(signed_conv, content, chat_type, sequence)
             .await?;
 
         let request = ChatSendMessageRequest {
-            allowed_recipients: allowed_recipients.to_vec(),
+            allowed_recipients,
             message: ChatSendMessageBody {
                 body: signed.body_base64,
             },
@@ -635,7 +609,7 @@ impl ChatManager {
                 tm_v: "2".to_owned(),
                 pub_jwt: signed.pub_jwt,
                 sig: signed.signature_base64,
-                npm: Some("1".to_owned()),
+                npm,
                 plf_nm: self.platform.as_str().to_owned(),
                 plf_id: self.self_id.as_str().to_owned(),
             },

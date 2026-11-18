@@ -165,7 +165,6 @@ impl Command {
         }
     }
 
-    /// Creates a group command that defaults `invoke_without_command = false` unless overridden.
     pub fn group<F, Fut, R>(name: impl Into<String>, callback: F) -> Self
     where
         F: Fn(Context) -> Fut + Send + Sync + 'static,

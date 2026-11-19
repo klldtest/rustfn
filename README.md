@@ -3,7 +3,7 @@
 Async Rust client for Epic Online Services and Fortnite.
 
 > [!NOTE]
-> **Note:** `rustfn` is currently in the development and testing phase. Everything is actively being tested and refined.
+> `rustfn` is currently in the development and testing phase. Everything is actively being tested and refined.
 > 
 ## Features
 

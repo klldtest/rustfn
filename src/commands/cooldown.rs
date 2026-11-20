@@ -101,7 +101,7 @@ impl CooldownMapping {
         if self.buckets.len() > 64 {
             self.buckets.retain(|_, v| {
                 v.try_lock()
-                    .map(|cd| !cd.is_expired(now))
+                    .map(|cd| Arc::strong_count(v) > 1 || !cd.is_expired(now))
                     .unwrap_or(true)
             });
         }
@@ -113,7 +113,7 @@ impl CooldownMapping {
             .value()
             .clone();
         let mut cooldown = bucket.lock().await;
-        cooldown.update_rate_limit(now)
+        cooldown.update_rate_limit(Instant::now())
     }
 
     pub fn reset_all(&self) {
@@ -167,5 +167,26 @@ impl MaxConcurrency {
                     per: self.per,
                 })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BucketType, CooldownMapping};
+    use crate::protocol::AccountId;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn eviction_keeps_buckets_with_waiting_users() {
+        let mapping = CooldownMapping::new(1, Duration::ZERO, BucketType::User);
+        let id = AccountId::parse(format!("{:032x}", 1)).unwrap();
+        mapping.update_rate_limit(&id).await;
+        let bucket = mapping.buckets.get(&Some(id.clone())).unwrap().clone();
+        for n in 2..=66 {
+            mapping.update_rate_limit(&AccountId::parse(format!("{n:032x}")).unwrap()).await;
+        }
+        let current = mapping.buckets.get(&Some(id)).unwrap();
+        assert!(Arc::ptr_eq(&bucket, current.value()));
     }
 }

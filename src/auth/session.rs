@@ -181,7 +181,8 @@ impl AuthSessionStore {
     }
 
     pub async fn get_session(&self, slot: AuthSessionSlot) -> Option<StoredAuthSession> {
-        let _ = self.refresh_gate(slot).lock().await;
+        let gate = self.refresh_gate(slot);
+        let _guard = gate.lock().await;
         self.sessions.read().await.get(&slot).cloned()
     }
 

@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{watch, RwLock};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -151,6 +151,28 @@ async fn build_resolver_falls_back_v2_to_v1_and_fetches_party_build_id() {
     .await
     .expect("party build id resolves");
     assert_eq!(party_build_id, "1:3:39009999");
+}
+
+#[tokio::test]
+async fn batch_fetch_returns_all_users_when_cache_is_small() {
+    let server = MockServer::start().await;
+    let http = make_http_with_pk(&server.uri(), "/primary-pk", "/fallback-pk");
+    let users = UserManager::new(http, CacheConfig {
+        max_users: 1,
+        ..CacheConfig::default()
+    });
+    Mock::given(method("GET"))
+        .and(path("/account/api/public/account"))
+        .respond_with(|req: &wiremock::Request| {
+            let records: Vec<Value> = req.url.query_pairs()
+                .filter(|(key, _)| key == "accountId")
+                .map(|(_, id)| json!({ "id": id, "displayName": "Bot" }))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(records)
+        })
+        .mount(&server).await;
+    let ids: Vec<AccountId> = (1..=40).map(make_account_id).collect();
+    assert_eq!(users.fetch_multiple(&ids).await.unwrap().len(), ids.len());
 }
 
 #[tokio::test]
@@ -904,10 +926,10 @@ async fn patches_chunk_at_32_keys_and_recover_from_stale_revision() {
     h.party.terminate().await;
 }
 
-async fn wait_for_keepalive_count(notify: &Notify, counter: &AtomicUsize, expected: usize) {
+async fn wait_for_keepalive_count(changes: &mut watch::Receiver<usize>, counter: &AtomicUsize, expected: usize) {
     tokio::time::timeout(Duration::from_secs(3), async {
         while counter.load(Ordering::SeqCst) < expected {
-            notify.notified().await;
+            changes.changed().await.unwrap();
         }
     })
     .await
@@ -919,8 +941,7 @@ async fn eos_keep_alive_ticks_every_60s_and_stops_cleanly_on_leave() {
     let server = MockServer::start().await;
     let keepalive_count = Arc::new(AtomicUsize::new(0));
     let count_clone = Arc::clone(&keepalive_count);
-    let keepalive_notify = Arc::new(Notify::new());
-    let notify_clone = Arc::clone(&keepalive_notify);
+    let (keepalive_changes, mut changes) = watch::channel(0);
     let eos_id = make_party_id(0xaa);
     let self_id = make_account_id(1);
     let fn_id = to_fortnite_lobby_id(&eos_id, "123456").expect("lobby id");
@@ -933,7 +954,7 @@ async fn eos_keep_alive_ticks_every_60s_and_stops_cleanly_on_leave() {
         )))
         .respond_with(move |_req: &Request| {
             count_clone.fetch_add(1, Ordering::SeqCst);
-            notify_clone.notify_waiters();
+            keepalive_changes.send_modify(|count| *count += 1);
             ResponseTemplate::new(204)
         })
         .mount(&server)
@@ -973,7 +994,7 @@ async fn eos_keep_alive_ticks_every_60s_and_stops_cleanly_on_leave() {
 
     assert_eq!(keepalive_count.load(Ordering::SeqCst), 0);
 
-    wait_for_keepalive_count(&keepalive_notify, &keepalive_count, 2).await;
+    wait_for_keepalive_count(&mut changes, &keepalive_count, 2).await;
     assert_eq!(keepalive_count.load(Ordering::SeqCst), 2);
 
     h.party.leave().await.expect("leave party");

@@ -30,7 +30,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Fluent builder constructing and optionally logging in a single [`Client`].
 pub struct ClientBuilder {
@@ -628,13 +628,33 @@ impl Client {
             .as_ref()
             .map(|x| x.subscribe_events());
         let presence_task = tokio::spawn(async move {
+            const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
             if let Err(err) = presence_client.set_status(None, None).await {
                 debug!(error = %err, "initial presence sync deferred");
             }
             let mut last_party: Option<(LobbyId, AccountId, usize, PresencePermission)> = None;
+            let mut presence_refresh_ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + PRESENCE_REFRESH_INTERVAL,
+                PRESENCE_REFRESH_INTERVAL,
+            );
+            presence_refresh_ticker
+                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = presence_cancel.cancelled() => break,
+                    _ = presence_refresh_ticker.tick(), if presence_client.is_ready() => {
+                        if let Err(err) = presence_client.set_status(None, None).await {
+                            if err.is_not_found() {
+                                warn!(error = %err, "periodic presence refresh returned not found; forcing STOMP reconnect");
+                                let stomp = { presence_client.inner.runtime.read().await.stomp.clone() };
+                                if let Some(stomp) = stomp {
+                                    let _ = stomp.force_reconnect().await;
+                                }
+                            } else {
+                                warn!(error = %err, "periodic presence refresh failed");
+                            }
+                        }
+                    }
                     recv = async {
                         match stomp_rx.as_mut() {
                             Some(rx) => rx.recv().await,
@@ -1161,7 +1181,13 @@ impl Client {
             let _ = self.init_party(self.inner.config.create_party, false).await;
             return;
         }
-        let _ = self.set_status(None, None).await;
+        if let Err(err) = self.set_status(None, None).await {
+            if err.is_not_found() {
+                warn!(error = %err, "set_status after EOS party rebind returned not found");
+            } else {
+                debug!(error = %err, "set_status after EOS party rebind failed");
+            }
+        }
     }
 
     /// Fetches a read-only snapshot of an arbitrary accessible party by Fortnite lobby ID or EOS party ID.

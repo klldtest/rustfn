@@ -358,6 +358,22 @@ pub struct CommandMap {
     primary: Vec<Arc<Command>>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{Command, CommandMap};
+
+    #[test]
+    fn case_insensitive_collision_keeps_existing_commands() {
+        let mut commands = CommandMap::new(false);
+        commands.add(Command::new("Ping", |_| async {})).unwrap();
+        commands.add(Command::new("ping", |_| async {})).unwrap();
+        assert!(commands.try_set_case_insensitive(true).is_err());
+        assert_eq!(commands.commands().len(), 2);
+        assert!(commands.get("Ping").is_some());
+        assert!(commands.get("ping").is_some());
+    }
+}
+
 impl CommandMap {
     pub fn new(case_insensitive: bool) -> Self {
         Self {
@@ -372,16 +388,21 @@ impl CommandMap {
     }
 
     pub fn set_case_insensitive(&mut self, insensitive: bool) {
+        self.try_set_case_insensitive(insensitive)
+            .expect("duplicate command name or alias after changing case sensitivity");
+    }
+
+    fn try_set_case_insensitive(&mut self, insensitive: bool) -> Result<(), CommandError> {
         if self.case_insensitive == insensitive {
-            return;
+            return Ok(());
         }
-        self.case_insensitive = insensitive;
-        let commands = std::mem::take(&mut self.primary);
-        self.by_key.clear();
-        for mut cmd in commands.into_iter().map(|c| (*c).clone()) {
-            cmd.subcommands.set_case_insensitive(insensitive);
-            let _ = self.add(cmd);
+        let mut rebuilt = Self::new(insensitive);
+        for mut cmd in self.primary.iter().map(|c| (**c).clone()) {
+            cmd.subcommands.try_set_case_insensitive(insensitive)?;
+            rebuilt.add(cmd)?;
         }
+        *self = rebuilt;
+        Ok(())
     }
 
     fn normalize(&self, key: &str) -> String {

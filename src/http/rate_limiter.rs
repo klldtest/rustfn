@@ -4,7 +4,6 @@ use reqwest::Method;
 use reqwest::header::HeaderMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Notify;
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -152,21 +151,14 @@ fn extract_in_seconds(message: &str) -> Option<u64> {
     None
 }
 
-#[derive(Debug, Clone)]
-struct BarrierState {
-    notify: Arc<Notify>,
-    ends_at: Instant,
-}
-
 #[derive(Debug, Default)]
 pub struct EndpointRateLimiter {
-    active: DashMap<ThrottleKey, BarrierState>,
+    active: DashMap<ThrottleKey, Instant>,
 }
 
 pub struct ThrottleBarrierGuard<'a> {
     limiter: &'a EndpointRateLimiter,
     key: ThrottleKey,
-    notify: Arc<Notify>,
     ends_at: Instant,
 }
 
@@ -176,12 +168,7 @@ impl Drop for ThrottleBarrierGuard<'_> {
         if Instant::now() < self.ends_at {
             return;
         }
-        let removed = self.limiter.active.remove_if(&self.key, |_, existing| {
-            Arc::ptr_eq(&existing.notify, &self.notify) && Instant::now() >= existing.ends_at
-        });
-        if removed.is_some() {
-            self.notify.notify_waiters();
-        }
+        self.limiter.active.remove_if(&self.key, |_, deadline| *deadline == self.ends_at);
     }
 }
 
@@ -192,23 +179,20 @@ impl EndpointRateLimiter {
 
     pub async fn wait_if_limited(&self, key: &ThrottleKey) {
         loop {
-            let Some(state) = self.active.get(key).map(|e| e.clone()) else {
+            let Some(deadline) = self.active.get(key).map(|entry| *entry) else {
                 return;
             };
 
-            if Instant::now() >= state.ends_at {
-                self.active
-                    .remove_if(key, |_, current| Arc::ptr_eq(&current.notify, &state.notify));
-                state.notify.notify_waiters();
-                return;
+            if Instant::now() >= deadline {
+                let removed = self.active
+                    .remove_if(key, |_, current| *current == deadline);
+                if removed.is_some() {
+                    return;
+                }
+                continue;
             }
 
-            let notified = state.notify.notified();
-            tokio::pin!(notified);
-            tokio::select! {
-                _ = &mut notified => {}
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(state.ends_at)) => {}
-            }
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
         }
     }
 
@@ -217,34 +201,15 @@ impl EndpointRateLimiter {
         key: ThrottleKey,
         duration: Duration,
     ) -> ThrottleBarrierGuard<'_> {
-        let notify = Arc::new(Notify::new());
         let ends_at = Instant::now() + duration;
-
-        if let Some(existing) = self.active.get(&key)
-            && existing.ends_at > ends_at
-        {
-            return ThrottleBarrierGuard {
-                limiter: self,
-                key,
-                notify: Arc::clone(&existing.notify),
-                ends_at: existing.ends_at,
-            };
-        }
-
-        if let Some(prev) = self.active.insert(
-            key.clone(),
-            BarrierState {
-                notify: Arc::clone(&notify),
-                ends_at,
-            },
-        ) {
-            prev.notify.notify_waiters();
-        }
+        let mut entry = self.active.entry(key.clone()).or_insert(ends_at);
+        *entry = (*entry).max(ends_at);
+        let ends_at = *entry;
+        drop(entry);
 
         ThrottleBarrierGuard {
             limiter: self,
             key,
-            notify,
             ends_at,
         }
     }

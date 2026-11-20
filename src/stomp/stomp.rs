@@ -544,6 +544,9 @@ async fn run_connection(
         };
     }
 
+    const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+    const WS_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
+
     let startup_deadline = Instant::now() + config.connection_timeout;
     let mut established = false;
     let mut heartbeat_active = false;
@@ -552,6 +555,9 @@ async fn run_connection(
         config.default_heartbeat,
     );
     heartbeat_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut ws_ping_ticker = interval_at(Instant::now() + WS_PING_INTERVAL, WS_PING_INTERVAL);
+    ws_ping_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_ws_activity = Instant::now();
 
     let mut public_sub_id: Option<String> = None;
     let mut private_sub_id: Option<String> = None;
@@ -579,6 +585,25 @@ async fn run_connection(
                 if let Err(err) = sink.send(Message::text("\n")).await {
                     return ConnectionExit::Error {
                         reason: format!("STOMP heartbeat write failed: {err}"),
+                        auth_failed: false,
+                        established,
+                    };
+                }
+            }
+            _ = ws_ping_ticker.tick(), if heartbeat_active => {
+                if last_ws_activity.elapsed() >= WS_ACTIVITY_TIMEOUT {
+                    let _ = sink.close().await;
+                    return ConnectionExit::Error {
+                        reason: format!(
+                            "STOMP WebSocket stalled without inbound activity for {WS_ACTIVITY_TIMEOUT:?}"
+                        ),
+                        auth_failed: false,
+                        established,
+                    };
+                }
+                if let Err(err) = sink.send(Message::Ping(Default::default())).await {
+                    return ConnectionExit::Error {
+                        reason: format!("STOMP WebSocket ping write failed: {err}"),
                         auth_failed: false,
                         established,
                     };
@@ -631,13 +656,24 @@ async fn run_connection(
             }
             frame = stream.next() => {
                 let raw_text = match frame {
-                    Some(Ok(Message::Text(text))) => text.to_string(),
-                    Some(Ok(Message::Binary(bytes))) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Some(Ok(Message::Text(text))) => {
+                        last_ws_activity = Instant::now();
+                        text.to_string()
+                    }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        last_ws_activity = Instant::now();
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    }
                     Some(Ok(Message::Ping(p))) => {
+                        last_ws_activity = Instant::now();
                         let _ = sink.send(Message::Pong(p)).await;
                         continue;
                     }
-                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => continue,
+                    Some(Ok(Message::Pong(_))) => {
+                        last_ws_activity = Instant::now();
+                        continue;
+                    }
+                    Some(Ok(Message::Frame(_))) => continue,
                     Some(Ok(Message::Close(_))) | None => {
                         return ConnectionExit::StreamClosed { established };
                     }
@@ -669,6 +705,9 @@ async fn run_connection(
                         );
                         heartbeat_ticker = interval_at(Instant::now() + delay, delay);
                         heartbeat_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                        ws_ping_ticker = interval_at(Instant::now() + WS_PING_INTERVAL, WS_PING_INTERVAL);
+                        ws_ping_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                        last_ws_activity = Instant::now();
                         heartbeat_active = true;
 
                         let sess_id = frame.header("session").map(ToOwned::to_owned);
@@ -990,10 +1029,22 @@ impl STOMPFrame {
             }
         }
 
-        let body_slice = body_and_nul
-            .split_once('\0')
-            .map_or(body_and_nul, |(b, _)| b);
-        let body = body_slice.trim_end_matches(['\r', '\n']).to_owned();
+        let content_length = headers.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.parse::<usize>())
+            .transpose()
+            .map_err(|_| RustfnError::Protocol("invalid STOMP content-length".to_owned()))?;
+        let body = if let Some(length) = content_length {
+            let body = body_and_nul.get(..length).ok_or_else(|| {
+                RustfnError::Protocol("invalid STOMP body length".to_owned())
+            })?;
+            if !body_and_nul[length..].starts_with('\0') {
+                return Err(RustfnError::Protocol("STOMP body missing terminator".to_owned()));
+            }
+            body
+        } else {
+            body_and_nul.split_once('\0').map_or(body_and_nul, |(body, _)| body)
+        }.to_owned();
 
         Ok(Some(Self {
             command,

@@ -6,7 +6,7 @@ use crate::protocol::{AccountId, CacheConfig, RustfnError, UserSearchPlatform};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
@@ -134,13 +134,26 @@ impl UserManager {
 
     /// Seeds partial `(account_id, display_name)` data without overwriting fresh full entries.
     pub fn upsert_partial(&self, account_id: &AccountId, display_name: Option<String>) {
-        if let Some(mut entry) = self.cache.get_mut(account_id) {
-            if entry.profile.display_name.is_none() && display_name.is_some() {
-                entry.profile.display_name = display_name;
+        use dashmap::mapref::entry::Entry;
+        match self.cache.entry(account_id.clone()) {
+            Entry::Occupied(mut entry) => {
+                if entry.get().profile.display_name.is_none() && display_name.is_some() {
+                    entry.get_mut().profile.display_name = display_name;
+                }
+                return;
             }
-            return;
+            Entry::Vacant(entry) => {
+                entry.insert(CachedUser {
+                    profile: UserProfile::partial(account_id.clone(), display_name),
+                    fetched_at: Instant::now(),
+                    is_partial: true,
+                });
+            }
         }
-        self.insert_cached(UserProfile::partial(account_id.clone(), display_name), true);
+        let slack = (self.config.max_users / 10).max(16);
+        if self.cache.len() > self.config.max_users.saturating_add(slack) {
+            self.sweep_expired();
+        }
     }
 
     pub async fn fetch(&self, account_id: &AccountId) -> Result<UserProfile, RustfnError> {
@@ -184,15 +197,19 @@ impl UserManager {
     ) -> Result<Vec<UserProfile>, RustfnError> {
         let mut missing = Vec::new();
         let mut seen_missing = HashSet::new();
+        let mut profiles = HashMap::new();
         for id in account_ids {
-            if self.get_cached(id).is_none() && seen_missing.insert(id.clone()) {
+            if let Some(profile) = self.get_cached(id) {
+                profiles.insert(id.clone(), profile);
+            } else if seen_missing.insert(id.clone()) {
                 missing.push(id.clone());
             }
         }
 
         for chunk in missing.chunks(ACCOUNT_BATCH_CHUNK_SIZE) {
             for record in self.http.fetch_accounts_multiple(chunk).await? {
-                self.cache_full(UserProfile::from_account_record(record));
+                let profile = self.cache_full(UserProfile::from_account_record(record));
+                profiles.insert(profile.id.clone(), profile);
             }
         }
 
@@ -200,9 +217,9 @@ impl UserManager {
         let mut seen = HashSet::new();
         for id in account_ids {
             if seen.insert(id.clone())
-                && let Some(entry) = self.cache.get(id)
+                && let Some(profile) = profiles.remove(id)
             {
-                results.push(entry.profile.clone());
+                results.push(profile);
             }
         }
         Ok(results)

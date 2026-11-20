@@ -22,7 +22,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::sync::{Notify, RwLock, broadcast};
+use tokio::sync::{Notify, RwLock, broadcast, watch};
 use tokio::time::Instant;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -203,7 +203,7 @@ pub struct AuthTokenCoordinator {
     endpoints: ServiceEndpoints,
     store: Arc<AuthSessionStore>,
     event_tx: broadcast::Sender<AuthEvent>,
-    wake_scheduler: Arc<Notify>,
+    refresh_signal: watch::Sender<u64>,
     device_auth: RwLock<Option<(AuthClient, DeviceAuthCredentials)>>,
 }
 
@@ -333,7 +333,7 @@ impl AuthTokenCoordinator {
             summary: refreshed.summary(),
         });
         if wake_loop {
-            self.wake_scheduler.notify_one();
+            self.refresh_signal.send_modify(|version| *version = version.wrapping_add(1));
         }
         Ok(refreshed)
     }
@@ -372,7 +372,7 @@ pub struct Auth {
     coordinator: Arc<AuthTokenCoordinator>,
     store: Arc<AuthSessionStore>,
     event_tx: broadcast::Sender<AuthEvent>,
-    wake_scheduler: Arc<Notify>,
+    refresh_signal: watch::Sender<u64>,
 }
 
 impl Auth {
@@ -389,14 +389,14 @@ impl Auth {
         let http_raw = shared_http_pool.share_pool_anonymous();
         let store = Arc::new(AuthSessionStore::new());
         let (event_tx, _) = broadcast::channel(64);
-        let wake_scheduler = Arc::new(Notify::new());
+        let (refresh_signal, _) = watch::channel(0);
 
         let coordinator = Arc::new(AuthTokenCoordinator {
             http_raw: http_raw.clone(),
             endpoints: config.endpoints.clone(),
             store: Arc::clone(&store),
             event_tx: event_tx.clone(),
-            wake_scheduler: Arc::clone(&wake_scheduler),
+            refresh_signal: refresh_signal.clone(),
             device_auth: RwLock::new(None),
         });
 
@@ -410,7 +410,7 @@ impl Auth {
             coordinator,
             store,
             event_tx,
-            wake_scheduler,
+            refresh_signal,
         }))
     }
 
@@ -705,7 +705,7 @@ impl Auth {
             ))
             .await;
 
-        self.wake_scheduler.notify_one();
+        self.refresh_signal.send_modify(|version| *version = version.wrapping_add(1));
         Ok(())
     }
 
@@ -860,9 +860,9 @@ impl Auth {
     }
 
     pub fn spawn_refresh_loop(self: &Arc<Self>, cancel: CancellationToken) -> TokenRefreshLoop {
-        TokenRefreshLoop::spawn(
+        TokenRefreshLoop::start(
             Arc::downgrade(self),
-            Arc::clone(&self.wake_scheduler),
+            None,
             cancel,
             self.config.refresh_lead_time,
         )
@@ -946,7 +946,7 @@ fn epic_response_to_stored(
 /// Refreshes active sessions before they expire.
 pub struct TokenRefreshLoop {
     cancel: CancellationToken,
-    wake: Arc<Notify>,
+    signal: watch::Sender<u64>,
     force_refresh: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -958,17 +958,28 @@ impl TokenRefreshLoop {
         cancel: CancellationToken,
         lead_time: Duration,
     ) -> Self {
+        Self::start(auth, Some(wake), cancel, lead_time)
+    }
+
+    fn start(
+        auth: Weak<Auth>,
+        wake: Option<Arc<Notify>>,
+        cancel: CancellationToken,
+        lead_time: Duration,
+    ) -> Self {
+        let signal = auth.upgrade().map(|auth| auth.refresh_signal.clone())
+            .unwrap_or_else(|| watch::channel(0).0);
+        let changes = signal.subscribe();
         let loop_cancel = cancel.clone();
-        let loop_wake = Arc::clone(&wake);
         let force_refresh = Arc::new(AtomicBool::new(false));
         let loop_force = Arc::clone(&force_refresh);
         let handle = tokio::spawn(async move {
-            run_loop(auth, loop_wake, loop_force, loop_cancel, lead_time).await;
+            run_loop(auth, wake, changes, loop_force, loop_cancel, lead_time).await;
         });
 
         Self {
             cancel,
-            wake,
+            signal,
             force_refresh,
             handle: Some(handle),
         }
@@ -976,7 +987,7 @@ impl TokenRefreshLoop {
 
     pub fn trigger_now(&self) {
         self.force_refresh.store(true, Ordering::Release);
-        self.wake.notify_one();
+        self.signal.send_modify(|version| *version = version.wrapping_add(1));
     }
 
     pub async fn stop(mut self) {
@@ -1012,18 +1023,12 @@ impl Default for Backoff {
 
 async fn run_loop(
     weak_auth: Weak<Auth>,
-    wake: Arc<Notify>,
+    wake: Option<Arc<Notify>>,
+    mut changes: watch::Receiver<u64>,
     force: Arc<AtomicBool>,
     cancel: CancellationToken,
     lead_time: Duration,
 ) {
-    // Drop stale permit left by initial login.
-    tokio::select! {
-        biased;
-        _ = wake.notified() => {}
-        _ = std::future::ready(()) => {}
-    }
-
     let mut backoff: HashMap<AuthSessionSlot, Backoff> = HashMap::new();
 
     loop {
@@ -1038,9 +1043,16 @@ async fn run_loop(
 
         tokio::select! {
             _ = cancel.cancelled() => return,
-            _ = wake.notified() => {
+            _ = changes.changed() => {
                 debug!("Auth refresh woken explicitly");
             }
+            _ = async {
+                match &wake {
+                    Some(wake) => wake.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+            _ = std::future::ready(()), if force.load(Ordering::Acquire) => {}
             _ = tokio::time::sleep(delay) => {}
         }
 

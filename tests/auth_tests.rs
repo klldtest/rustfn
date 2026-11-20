@@ -743,7 +743,10 @@ async fn loop_skips_unexpired_fortnite_slot() {
             refresh_lead_time: Duration::from_secs(300),
             ..AuthConfig::default()
         },
-        HttpClientConfig::default(),
+        HttpClientConfig {
+            retry: rustfn::http::RetryConfig { rest_retry_limit: 0, ..Default::default() },
+            ..Default::default()
+        },
     )
     .unwrap();
 
@@ -757,7 +760,6 @@ async fn loop_skips_unexpired_fortnite_slot() {
     let cancel = CancellationToken::new();
     let refresh_loop = auth.spawn_refresh_loop(cancel);
     tokio::time::sleep(Duration::from_millis(250)).await;
-    refresh_loop.stop().await;
 
     assert_eq!(
         eos_refresh_calls.load(Ordering::SeqCst),
@@ -769,6 +771,13 @@ async fn loop_skips_unexpired_fortnite_slot() {
         0,
         "Fortnite slot with 4h remaining must not be refreshed"
     );
+    refresh_loop.trigger_now();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fn_refresh_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("manual refresh starts promptly");
+    refresh_loop.stop().await;
 }
 
 #[tokio::test]

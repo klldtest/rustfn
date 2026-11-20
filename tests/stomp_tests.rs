@@ -66,6 +66,9 @@ fn stomp_frame_roundtrip_and_dedupe_ring() {
     assert_eq!(parsed, reparsed);
 
     assert!(STOMPFrame::parse("\n").unwrap().is_none());
+    assert_eq!(STOMPFrame::parse("MESSAGE\n\nhello\n\0").unwrap().unwrap().body, "hello\n");
+    assert_eq!(STOMPFrame::parse("MESSAGE\ncontent-length:3\n\na\0b\0").unwrap().unwrap().body, "a\0b");
+    assert!(STOMPFrame::parse("MESSAGE\ncontent-length:4\n\na\0b\0").is_err());
 
     let mut dedupe = STOMPMessageDedupe::new(3);
     assert!(dedupe.mark_if_new("m1"));

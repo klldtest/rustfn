@@ -776,11 +776,16 @@ pub async fn run_connection(
                     (HandshakeStage::AwaitSessionResult, XMPPIncomingStanza::IqResult { id, jid })
                         if id.as_deref() == Some("sess_1") =>
                     {
-                        if let Some((status, show)) = &params.initial_presence {
-                            let pres = presence_frame(status.as_deref(), show.as_deref(), false);
-                            let _ = sink.send(Message::text(pres)).await;
+                        let presence = if let Some((status, show)) = &params.initial_presence {
+                            presence_frame(status.as_deref(), show.as_deref(), false)
                         } else {
-                            let _ = sink.send(Message::text(presence_frame(None, None, false))).await;
+                            presence_frame(None, None, false)
+                        };
+                        if let Err(err) = sink.send(Message::text(presence)).await {
+                            return ConnectionExit::Error {
+                                reason: format!("XMPP presence write failed: {err}"),
+                                auth_failed: false,
+                            };
                         }
                         last_pong = Instant::now();
                         stage = HandshakeStage::Established;

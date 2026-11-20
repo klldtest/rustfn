@@ -3,7 +3,7 @@ use rustfn::http::{
     AuthSessionSlot, BoxFuture, ChatMessageMetadata, ChatSendMessageBody, ChatSendMessageRequest,
     ChatSendMessageResponse, HTTP, HttpClient, HttpClientConfig, HttpRequestSpec,
     PublicKeyResponse, RetryConfig, RetryDecision, TokenProvider, extract_retry_after,
-    sanitize_route_template,
+    sanitize_route_template, EndpointRateLimiter, ThrottleKey,
 };
 use rustfn::protocol::{
     AccountId, EpicgamesAPIErrorData, ExtraServiceEndpoints, RustfnError, ServiceEndpoints,
@@ -22,6 +22,18 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 struct PingPayload {
     ok: bool,
     attempt: usize,
+}
+
+#[tokio::test]
+async fn overlapping_cooldowns_keep_the_latest_deadline() {
+    let limiter = EndpointRateLimiter::new();
+    let key = ThrottleKey::from_request(&reqwest::Method::GET, "https://example.com/test", None, None);
+    let short = limiter.enter_cooldown(key.clone(), Duration::from_millis(40));
+    let long = limiter.enter_cooldown(key.clone(), Duration::from_millis(180));
+    drop(short);
+    assert!(tokio::time::timeout(Duration::from_millis(80), limiter.wait_if_limited(&key)).await.is_err());
+    tokio::time::timeout(Duration::from_secs(1), limiter.wait_if_limited(&key)).await.unwrap();
+    drop(long);
 }
 
 struct MockTokenProvider {

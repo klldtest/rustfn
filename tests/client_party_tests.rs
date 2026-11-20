@@ -76,18 +76,20 @@ fn make_http_with_pk(mock_uri: &str, pk_path: &str, pk_fallback_path: &str) -> H
         .expect("http client")
         .with_token_provider(Arc::new(StaticTokenProvider));
 
-    let mut endpoints = ServiceEndpoints::default();
-    endpoints.launcher_public = format!("{mock_uri}/launcher/api").into();
-    endpoints.account_public = format!("{mock_uri}/account/api/public/account").into();
-    endpoints.friends = format!("{mock_uri}/friends/api/v1").into();
-    endpoints.friends_public = format!("{mock_uri}/friends/api/public/friends").into();
-    endpoints.friends_blocklist_public = format!("{mock_uri}/friends/api/public/blocklist").into();
-    endpoints.br_party = format!("{mock_uri}/party/api/v1/Fortnite").into();
-    endpoints.eos_party = format!("{mock_uri}/epic/party").into();
-    endpoints.eos_party_internal = format!("{mock_uri}/epic/party/internal/v2").into();
-    endpoints.publickey = format!("{mock_uri}{pk_path}").into();
-    endpoints.publickey_fallback = format!("{mock_uri}{pk_fallback_path}").into();
-    endpoints.eos_chat = format!("{mock_uri}/epic/chat").into();
+    let endpoints = ServiceEndpoints {
+        launcher_public: format!("{mock_uri}/launcher/api").into(),
+        account_public: format!("{mock_uri}/account/api/public/account").into(),
+        friends: format!("{mock_uri}/friends/api/v1").into(),
+        friends_public: format!("{mock_uri}/friends/api/public/friends").into(),
+        friends_blocklist_public: format!("{mock_uri}/friends/api/public/blocklist").into(),
+        br_party: format!("{mock_uri}/party/api/v1/Fortnite").into(),
+        eos_party: format!("{mock_uri}/epic/party").into(),
+        eos_party_internal: format!("{mock_uri}/epic/party/internal/v2").into(),
+        publickey: format!("{mock_uri}{pk_path}").into(),
+        publickey_fallback: format!("{mock_uri}{pk_fallback_path}").into(),
+        eos_chat: format!("{mock_uri}/epic/chat").into(),
+        ..ServiceEndpoints::default()
+    };
 
     let extra = ExtraServiceEndpoints {
         br_matchmaking_request: format!("{mock_uri}/matchmaking/matchMakingRequest"),

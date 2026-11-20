@@ -75,7 +75,7 @@ pub enum RetryDecision {
 
 pub type RetryDecisionHook = Arc<dyn Fn() -> RetryDecision + Send + Sync>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RetryConfig {
     pub max_retry_attempts: usize,
     pub rest_retry_limit: usize,
@@ -88,22 +88,6 @@ pub struct RetryConfig {
     pub handle_rate_limits: bool,
     pub handle_capacity_throttling: bool,
     pub other_requests_wait: bool,
-}
-
-impl PartialEq for RetryConfig {
-    fn eq(&self, other: &Self) -> bool {
-        self.max_retry_attempts == other.max_retry_attempts
-            && self.rest_retry_limit == other.rest_retry_limit
-            && self.max_wait_time == other.max_wait_time
-            && self.max_retry_after == other.max_retry_after
-            && self.backoff_start == other.backoff_start
-            && self.backoff_factor.to_bits() == other.backoff_factor.to_bits()
-            && self.backoff_cap == other.backoff_cap
-            && self.retry_after_padding == other.retry_after_padding
-            && self.handle_rate_limits == other.handle_rate_limits
-            && self.handle_capacity_throttling == other.handle_capacity_throttling
-            && self.other_requests_wait == other.other_requests_wait
-    }
 }
 
 impl Default for RetryConfig {
@@ -183,14 +167,21 @@ pub struct ThrottleBarrierGuard<'a> {
     limiter: &'a EndpointRateLimiter,
     key: ThrottleKey,
     notify: Arc<Notify>,
+    ends_at: Instant,
 }
 
 impl Drop for ThrottleBarrierGuard<'_> {
     fn drop(&mut self) {
-        self.limiter
-            .active
-            .remove_if(&self.key, |_, existing| Arc::ptr_eq(&existing.notify, &self.notify));
-        self.notify.notify_waiters();
+        // Only clear the barrier once its deadline expires so a cancelled caller never lifts a live cooldown early.
+        if Instant::now() < self.ends_at {
+            return;
+        }
+        let removed = self.limiter.active.remove_if(&self.key, |_, existing| {
+            Arc::ptr_eq(&existing.notify, &self.notify) && Instant::now() >= existing.ends_at
+        });
+        if removed.is_some() {
+            self.notify.notify_waiters();
+        }
     }
 }
 
@@ -229,6 +220,17 @@ impl EndpointRateLimiter {
         let notify = Arc::new(Notify::new());
         let ends_at = Instant::now() + duration;
 
+        if let Some(existing) = self.active.get(&key)
+            && existing.ends_at > ends_at
+        {
+            return ThrottleBarrierGuard {
+                limiter: self,
+                key,
+                notify: Arc::clone(&existing.notify),
+                ends_at: existing.ends_at,
+            };
+        }
+
         if let Some(prev) = self.active.insert(
             key.clone(),
             BarrierState {
@@ -243,6 +245,7 @@ impl EndpointRateLimiter {
             limiter: self,
             key,
             notify,
+            ends_at,
         }
     }
 }

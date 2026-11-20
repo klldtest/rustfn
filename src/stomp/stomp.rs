@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 /// Configuration for [`STOMP`] EOS Connect STOMP 1.2 WebSocket sessions.
 #[derive(Debug, Clone)]
@@ -44,9 +44,9 @@ impl Default for STOMPConfig {
             deployment_id: DeploymentId::from_raw(EOS_EAS_DEPLOYMENT_ID),
             ws_subprotocol: None,
             subscribe_puid: true,
-            default_heartbeat: Duration::from_secs(30),
+            default_heartbeat: Duration::from_secs(20),
             connection_timeout: Duration::from_secs(60),
-            max_connection_retries: 5,
+            max_connection_retries: 20,
             retry_delay: Duration::from_secs(5),
             dedupe_capacity: DEFAULT_DEDUPE_CAPACITY,
             event_channel_capacity: 512,
@@ -283,30 +283,25 @@ impl STOMP {
                             let _ = tx.send(Err(msg));
                             break;
                         }
-                        if retry_count < config.max_connection_retries {
-                            retry_count += 1;
-                            let _ = event_tx.send(Arc::new(STOMPEvent::Disconnected {
-                                will_reconnect: true,
-                                reason: msg,
-                            }));
-                            tokio::select! {
-                                _ = cancel.cancelled() => break,
-                                _ = tokio::time::sleep(config.retry_delay) => continue,
-                            }
-                        } else {
-                            let _ = event_tx.send(Arc::new(STOMPEvent::ReconnectExhausted {
-                                attempts: retry_count,
-                                last_error: msg,
-                            }));
+                        if !schedule_stomp_reconnect(
+                            &mut retry_count,
+                            &config,
+                            &event_tx,
+                            &cancel,
+                            msg,
+                        )
+                        .await
+                        {
                             break;
                         }
+                        continue;
                     }
                 };
 
                 let puid_snapshot = product_user_id.lock().await.clone();
                 let mut first_tx_for_conn = first_ready_tx.take();
 
-                let exit = run_single_stomp_connection(
+                let exit = run_connection(
                     &config,
                     &account_id,
                     puid_snapshot,
@@ -346,21 +341,15 @@ impl STOMP {
                             let _ = tx.send(Err("STOMP connection closed before establishment".to_owned()));
                             break;
                         }
-                        if retry_count < config.max_connection_retries {
-                            retry_count += 1;
-                            let _ = event_tx.send(Arc::new(STOMPEvent::Disconnected {
-                                will_reconnect: true,
-                                reason: "STOMP stream closed".to_owned(),
-                            }));
-                            tokio::select! {
-                                _ = cancel.cancelled() => break,
-                                _ = tokio::time::sleep(config.retry_delay) => continue,
-                            }
-                        } else {
-                            let _ = event_tx.send(Arc::new(STOMPEvent::ReconnectExhausted {
-                                attempts: retry_count,
-                                last_error: "STOMP stream closed".to_owned(),
-                            }));
+                        if !schedule_stomp_reconnect(
+                            &mut retry_count,
+                            &config,
+                            &event_tx,
+                            &cancel,
+                            "STOMP stream closed".to_owned(),
+                        )
+                        .await
+                        {
                             break;
                         }
                     }
@@ -384,34 +373,22 @@ impl STOMP {
                             let _ = tx.send(Err(reason));
                             break;
                         }
-                        if retry_count < config.max_connection_retries {
-                            retry_count += 1;
-                            info!(
-                                account_id = %account_id,
-                                retry = retry_count,
-                                max_retries = config.max_connection_retries,
-                                reason = %reason,
-                                "STOMP disconnected; scheduling reconnect"
-                            );
-                            let _ = event_tx.send(Arc::new(STOMPEvent::Disconnected {
-                                will_reconnect: true,
-                                reason,
-                            }));
-                            tokio::select! {
-                                _ = cancel.cancelled() => break,
-                                _ = tokio::time::sleep(config.retry_delay) => continue,
-                            }
-                        } else {
-                            warn!(
-                                account_id = %account_id,
-                                max_retries = config.max_connection_retries,
-                                reason = %reason,
-                                "STOMP reconnect retries exhausted"
-                            );
-                            let _ = event_tx.send(Arc::new(STOMPEvent::ReconnectExhausted {
-                                attempts: retry_count,
-                                last_error: reason,
-                            }));
+                        info!(
+                            account_id = %account_id,
+                            retry = retry_count + 1,
+                            max_retries = config.max_connection_retries,
+                            reason = %reason,
+                            "STOMP disconnected"
+                        );
+                        if !schedule_stomp_reconnect(
+                            &mut retry_count,
+                            &config,
+                            &event_tx,
+                            &cancel,
+                            reason,
+                        )
+                        .await
+                        {
                             break;
                         }
                     }
@@ -478,7 +455,7 @@ impl STOMP {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_single_stomp_connection(
+async fn run_connection(
     config: &STOMPConfig,
     account_id: &AccountId,
     puid_initial: Option<ProductUserId>,
@@ -751,9 +728,14 @@ async fn run_single_stomp_connection(
                                 false,
                                 sess_id.as_ref().map(|s| format!("sub-2-{s}")),
                             );
-                            if sink.send(Message::text(sub_puid.encode())).await.is_ok() {
-                                puid_sub_id = Some(puid_id);
+                            if let Err(err) = sink.send(Message::text(sub_puid.encode())).await {
+                                return ConnectionExit::Error {
+                                    reason: format!("STOMP PUID subscribe write failed: {err}"),
+                                    auth_failed: false,
+                                    established,
+                                };
                             }
+                            puid_sub_id = Some(puid_id);
                         }
                     }
                     STOMPCommand::Receipt => {
@@ -773,7 +755,7 @@ async fn run_single_stomp_connection(
                             .or_else(|| frame.header("message"))
                             .unwrap_or("STOMP error frame")
                             .to_owned();
-                        let auth_failed = status_code == Some(4019);
+                        let auth_failed = matches!(status_code, Some(4019 | 401 | 403));
 
                         let _ = event_tx.send(Arc::new(STOMPEvent::ErrorFrame {
                             status_code,
@@ -783,7 +765,10 @@ async fn run_single_stomp_connection(
                         let _ = sink.close().await;
                         return ConnectionExit::Error {
                             reason: if auth_failed {
-                                "STOMP authentication token expired (4019)".to_owned()
+                                format!(
+                                    "STOMP authentication token expired ({})",
+                                    status_code.unwrap_or(4019)
+                                )
                             } else {
                                 message
                             },
@@ -1005,15 +990,45 @@ impl STOMPFrame {
             }
         }
 
-        let body = body_and_nul
-            .trim_end_matches(['\0', '\r', '\n'])
-            .to_owned();
+        let body_slice = body_and_nul
+            .split_once('\0')
+            .map_or(body_and_nul, |(b, _)| b);
+        let body = body_slice.trim_end_matches(['\r', '\n']).to_owned();
 
         Ok(Some(Self {
             command,
             headers,
             body,
         }))
+    }
+}
+
+async fn schedule_stomp_reconnect(
+    retry_count: &mut u32,
+    config: &STOMPConfig,
+    event_tx: &broadcast::Sender<Arc<STOMPEvent>>,
+    cancel: &CancellationToken,
+    reason: String,
+) -> bool {
+    if *retry_count >= config.max_connection_retries {
+        let _ = event_tx.send(Arc::new(STOMPEvent::ReconnectExhausted {
+            attempts: *retry_count,
+            last_error: reason,
+        }));
+        return false;
+    }
+    *retry_count += 1;
+    let _ = event_tx.send(Arc::new(STOMPEvent::Disconnected {
+        will_reconnect: true,
+        reason,
+    }));
+    let delay = config
+        .retry_delay
+        .saturating_mul(1u32 << retry_count.saturating_sub(1).min(3))
+        .min(Duration::from_secs(30));
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
     }
 }
 

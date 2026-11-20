@@ -16,7 +16,3 @@ pub use message::{
 pub use metadata_store::{
     DEFAULT_MEMBER_METADATA_TTL, QueuedMemberMetadataUpdate, XMPPMetadataStore,
 };
-
-pub use crate::events::{
-    RealtimeEventContext, spawn_stomp_event_handler, spawn_xmpp_event_handler,
-};

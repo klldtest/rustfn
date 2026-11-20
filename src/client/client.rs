@@ -171,7 +171,7 @@ struct ClientInner {
     session_cancel: Mutex<Option<CancellationToken>>,
     driver_tasks: Mutex<Vec<JoinHandle<()>>>,
     session_lock: Mutex<()>,
-    party_lock: Mutex<()>,
+    party_lock: Arc<Mutex<()>>,
     last_auth: RwLock<Option<AuthMethod>>,
     ready_tx: watch::Sender<bool>,
     ready_rx: watch::Receiver<bool>,
@@ -250,7 +250,7 @@ impl Client {
                 session_cancel: Mutex::new(None),
                 driver_tasks: Mutex::new(Vec::new()),
                 session_lock: Mutex::new(()),
-                party_lock: Mutex::new(()),
+                party_lock: Arc::new(Mutex::new(())),
                 last_auth: RwLock::new(None),
                 ready_tx,
                 ready_rx,
@@ -479,7 +479,8 @@ impl Client {
                 xmpp: xmpp.clone(),
                 stomp: stomp.clone(),
                 party_slot: Arc::clone(&self.inner.party_slot),
-                presence_permission: PresencePermission::Anyone,
+                party_lock: Arc::clone(&self.inner.party_lock),
+                default_presence_permission: cfg.party.privacy.presence_permission,
             };
 
             {
@@ -551,7 +552,7 @@ impl Client {
                 }
                 Ok::<_, RustfnError>(())
             };
-        let eos_prep_fut = Box::pin(async {
+            let eos_prep_fut = Box::pin(async {
                 let Ok(puid) = eos_rx.await else {
                     // Auth failed before EOS token; `auth_fut` returns the real error.
                     return Ok::<_, RustfnError>(false);
@@ -559,60 +560,53 @@ impl Client {
                 if let Some(ref s) = stomp {
                     s.set_product_user_id(puid).await;
                 }
-                let stomp_connect_fut = Box::pin(async {
+                let stomp_connect_fut = async {
                     if let Some(ref s) = stomp {
                         let _ = s.connect(cancel.clone()).await?;
                     }
                     Ok::<_, RustfnError>(())
-                });
-                let eos_cleanup_fut = Box::pin(async {
+                };
+                let eos_cleanup_fut = async {
                     if pre_destroy_party {
                         self.leave_eos_party_only(&account_id).await?;
                     }
                     Ok::<_, RustfnError>(())
-                });
+                };
                 tokio::try_join!(stomp_connect_fut, eos_cleanup_fut)?;
                 Ok(true)
             });
 
-            let party_chain_fut = Box::pin(async {
-                let (_, _, eos_ready) = tokio::try_join!(
-                    Box::pin(build_id_fut),
-                    Box::pin(fn_cleanup_fut),
-                    eos_prep_fut,
-                )?;
-                if eos_ready && !cfg.disable_party_service {
-                    self.init_party_on_login(&account_id, pre_destroy_party, false)
-                        .await?;
-                }
-                Ok::<_, RustfnError>(())
-            });
-
-            let (display_name, _, _, _) = tokio::try_join!(
+            let (display_name, _, _, _, _, eos_ready) = tokio::try_join!(
                 Box::pin(profile_fut),
                 Box::pin(friends_fut),
                 Box::pin(xmpp_fut),
-                party_chain_fut,
+                Box::pin(build_id_fut),
+                Box::pin(fn_cleanup_fut),
+                eos_prep_fut,
             )?;
+
+            if eos_ready && !cfg.disable_party_service {
+                Box::pin(self.init_party_on_login(&account_id, pre_destroy_party, false)).await?;
+            }
             Ok(Some((account_id, display_name)))
         };
 
         let join_res = tokio::try_join!(Box::pin(auth_fut), Box::pin(connect_fut));
         let (account_id, display_name) = match join_res {
-                Ok(((), Some(identity))) => identity,
-                Ok(((), None)) => {
-                    auth_handle.abort();
-                    let _ = self.destroy(false).await;
-                    return Err(RustfnError::Auth(
-                        "authenticated Fortnite session missing account_id".to_owned(),
-                    ));
-                }
-                Err(err) => {
-                    auth_handle.abort();
-                    let _ = self.destroy(false).await;
-                    return Err(err);
-                }
-            };
+            Ok(((), Some(identity))) => identity,
+            Ok(((), None)) => {
+                auth_handle.abort();
+                let _ = self.destroy(false).await;
+                return Err(RustfnError::Auth(
+                    "authenticated Fortnite session missing account_id".to_owned(),
+                ));
+            }
+            Err(err) => {
+                auth_handle.abort();
+                let _ = self.destroy(false).await;
+                return Err(err);
+            }
+        };
 
         let presence_client = self.clone();
         let presence_cancel = cancel.child_token();
@@ -641,40 +635,56 @@ impl Client {
             loop {
                 tokio::select! {
                     _ = presence_cancel.cancelled() => break,
-                    Some(Ok(stomp_ev)) = async {
+                    recv = async {
                         match stomp_rx.as_mut() {
-                            Some(rx) => Some(rx.recv().await),
-                            None => None,
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
                         }
-                    }, if stomp_rx.is_some() => {
-                        if let STOMPEvent::Connected(_) = &*stomp_ev && presence_client.is_ready() {
-                            let client = presence_client.clone();
-                            let task_cancel = presence_cancel.clone();
-                            tokio::spawn(async move {
-                                tokio::select! {
-                                    _ = task_cancel.cancelled() => {}
-                                    () = client.rebind_eos_party_connection() => {}
-                                }
-                            });
+                    }, if stomp_rx.is_some() => match recv {
+                        Ok(stomp_ev) => {
+                            if let STOMPEvent::Connected(_) = &*stomp_ev && presence_client.is_ready() {
+                                let client = presence_client.clone();
+                                let task_cancel = presence_cancel.clone();
+                                tokio::spawn(async move {
+                                    tokio::select! {
+                                        _ = task_cancel.cancelled() => {}
+                                        () = client.rebind_eos_party_connection() => {}
+                                    }
+                                });
+                            }
                         }
-                    }
-                    Some(Ok(xmpp_ev)) = async {
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            debug!(skipped, "presence task lagged on STOMP events");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            stomp_rx = None;
+                        }
+                    },
+                    recv = async {
                         match xmpp_rx.as_mut() {
-                            Some(rx) => Some(rx.recv().await),
-                            None => None,
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
                         }
-                    }, if xmpp_rx.is_some() => {
-                        if let XMPPEvent::Connected { .. } = &*xmpp_ev && presence_client.is_ready() {
-                            let client = presence_client.clone();
-                            let task_cancel = presence_cancel.clone();
-                            tokio::spawn(async move {
-                                tokio::select! {
-                                    _ = task_cancel.cancelled() => {}
-                                    _ = client.set_status(None, None) => {}
-                                }
-                            });
+                    }, if xmpp_rx.is_some() => match recv {
+                        Ok(xmpp_ev) => {
+                            if let XMPPEvent::Connected { .. } = &*xmpp_ev && presence_client.is_ready() {
+                                let client = presence_client.clone();
+                                let task_cancel = presence_cancel.clone();
+                                tokio::spawn(async move {
+                                    tokio::select! {
+                                        _ = task_cancel.cancelled() => {}
+                                        _ = client.set_status(None, None) => {}
+                                    }
+                                });
+                            }
                         }
-                    }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            debug!(skipped, "presence task lagged on XMPP events");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            xmpp_rx = None;
+                        }
+                    },
                     recv = presence_rx.recv() => match recv {
                         Ok(ev) => {
                             let mut check_party = party_event_requires_init_party(&ev);
@@ -794,12 +804,14 @@ impl Client {
         };
 
         let party_size = party_snapshot.as_ref().map_or(1, |s| s.size() as i64);
-        let party_join_info = party_snapshot.as_ref().map(|snap| {
+        let is_joinable = party_snapshot.as_ref().is_some_and(|snap| {
             let perm = snap.config.privacy.presence_permission;
             let self_is_leader = snap.leader_id == account_id;
-            let share_details = perm == PresencePermission::Anyone
-                || (perm == PresencePermission::Leader && self_is_leader);
-            if share_details {
+            perm == PresencePermission::Anyone
+                || (perm == PresencePermission::Leader && self_is_leader)
+        });
+        let party_join_info = party_snapshot.as_ref().map(|snap| {
+            if is_joinable {
                 PartyJoinInfoData {
                     source_id: Some(account_id.clone()),
                     source_display_name: display_name.clone(),
@@ -828,13 +840,6 @@ impl Client {
                     pc: None,
                 }
             }
-        });
-
-        let is_joinable = party_snapshot.as_ref().is_some_and(|s| {
-            let perm = s.config.privacy.presence_permission;
-            let self_is_leader = s.leader_id == account_id;
-            perm == PresencePermission::Anyone
-                || (perm == PresencePermission::Leader && self_is_leader)
         });
         let island_code = party_snapshot
             .as_ref()
@@ -972,16 +977,37 @@ impl Client {
         self.init_party_unlocked(create_new, force_new).await
     }
 
-    /// Fetches the client's active EOS + Fortnite party from Epic's servers, returning `None` if not in a party.
-    pub async fn get_client_party(&self) -> Result<Option<ClientParty>, RustfnError> {
+    /// Fetches a snapshot of the client's active EOS + Fortnite party from Epic's servers,
+    /// returning `None` if not in a party (without spawning background keep-alive tasks).
+    pub async fn get_client_party(&self) -> Result<Option<PartySnapshot>, RustfnError> {
         let Some((fn_data, eos_data)) = self.fetch_client_party_data().await? else {
             return Ok(None);
         };
-        let party = self.spawn_client_party(fn_data, eos_data, None).await?;
-        Ok(Some(party))
+        let account_id = self
+            .account_id()
+            .await
+            .ok_or_else(|| RustfnError::Auth("client is not logged in".to_owned()))?;
+        let display_name = self
+            .display_name()
+            .await
+            .unwrap_or_else(|| account_id.as_str().to_owned());
+        let saved = self.inner.saved_member_meta.read().await.clone();
+        let state = PartyState::from_joined_data(
+            account_id,
+            None,
+            display_name,
+            self.inner.config.platform,
+            self.inner.config.region,
+            &self.inner.config.party,
+            fn_data,
+            eos_data,
+            saved.as_ref(),
+            &self.inner.fallback_metadata_store,
+        );
+        Ok(Some(state.snapshot))
     }
 
-    /// Fetches raw Fortnite party data by Fortnite lobby ID (`getRawFortniteParty`).
+    /// Fetches raw Fortnite party data by Fortnite lobby ID.
     pub async fn get_raw_fortnite_party(&self, id: &LobbyId) -> Result<FortnitePartyData, RustfnError> {
         self.inner.http.get_fn_party(id).await
     }
@@ -1097,7 +1123,7 @@ impl Client {
         Ok(())
     }
 
-    /// Rebinds the active EOS party connection after STOMP reconnects (`rebindEOSPartyConnection`).
+    /// Rebinds the active EOS party connection after STOMP reconnects.
     async fn rebind_eos_party_connection(&self) {
         if self.inner.config.disable_party_service {
             return;
@@ -1131,7 +1157,7 @@ impl Client {
             )
             .await
         {
-            debug!(error = %err, "rebindEOSPartyConnection failed; reinitializing party");
+            debug!(error = %err, "rebind_eos_party_connection failed; reinitializing party");
             let _ = self.init_party(self.inner.config.create_party, false).await;
             return;
         }
@@ -1228,7 +1254,7 @@ impl Client {
         let friends = self
             .friends()
             .await
-            .ok_or_else(|| RustfnError::PartyState("friend manager unavailable before login".to_owned()))?;
+            .ok_or_else(|| RustfnError::Auth("friend manager unavailable before login".to_owned()))?;
         friends.add(id_or_name).await
     }
 
@@ -1236,7 +1262,7 @@ impl Client {
         let friends = self
             .friends()
             .await
-            .ok_or_else(|| RustfnError::PartyState("friend manager unavailable before login".to_owned()))?;
+            .ok_or_else(|| RustfnError::Auth("friend manager unavailable before login".to_owned()))?;
         friends.remove(id_or_name).await
     }
 
@@ -1248,7 +1274,7 @@ impl Client {
         let chat = self
             .chat()
             .await
-            .ok_or_else(|| RustfnError::PartyState("chat manager unavailable before login".to_owned()))?;
+            .ok_or_else(|| RustfnError::Auth("chat manager unavailable before login".to_owned()))?;
         chat.send_friend_message(id_or_name, content).await
     }
 
@@ -1361,11 +1387,7 @@ impl Client {
     ) -> Result<ClientParty, RustfnError> {
         self.leave_party_unlocked().await?;
 
-        let (account_id, _display_name, conn, xmpp_jid) = self.require_party_context().await?;
-        let display_name = self
-            .display_name()
-            .await
-            .unwrap_or_else(|| account_id.as_str().to_owned());
+        let (account_id, display_name, conn, xmpp_jid) = self.require_party_context().await?;
         let build_id = self.ensure_party_build_id().await?;
 
         let cfg = &self.inner.config;
@@ -1431,25 +1453,17 @@ impl Client {
         fn_data.config.intention_ttl = cfg.party.intention_ttl_secs;
         fn_data.config.join_confirmation = cfg.party.join_confirmation;
 
-        let custom_privacy = if privacy != cfg.party.privacy {
-            if privacy.party_type == PartyType::Private {
-                fn_data.config.discoverability = PartyDiscoverability::InvitedOnly;
-                fn_data.config.joinability = PartyJoinability::InviteAndFormer;
-            } else {
-                fn_data.config.discoverability = PartyDiscoverability::All;
-                fn_data.config.joinability = PartyJoinability::Open;
-            }
-            Some(privacy)
+        let custom_privacy = (privacy != cfg.party.privacy).then_some(privacy);
+        if privacy.party_type == PartyType::Private {
+            fn_data.config.discoverability = PartyDiscoverability::InvitedOnly;
+            fn_data.config.joinability = PartyJoinability::InviteAndFormer;
+        } else if custom_privacy.is_some() {
+            fn_data.config.discoverability = PartyDiscoverability::All;
+            fn_data.config.joinability = PartyJoinability::Open;
         } else {
-            if privacy.party_type == PartyType::Private {
-                fn_data.config.discoverability = PartyDiscoverability::InvitedOnly;
-                fn_data.config.joinability = PartyJoinability::InviteAndFormer;
-            } else {
-                fn_data.config.discoverability = cfg.party.discoverability;
-                fn_data.config.joinability = cfg.party.joinability;
-            }
-            None
-        };
+            fn_data.config.discoverability = cfg.party.discoverability;
+            fn_data.config.joinability = cfg.party.joinability;
+        }
 
         let party = self
             .spawn_client_party(fn_data, eos_data, custom_privacy)
@@ -1462,19 +1476,15 @@ impl Client {
                     updated: snap.meta.as_meta().as_map().clone(),
                     deleted: Vec::new(),
                 };
-                let party_fut = party.send_patch(full_schema_patch);
+                party.send_patch(full_schema_patch).await?;
                 if let Some(me) = snap.members.get(&account_id) {
                     let member_patch = MetaPatch {
                         updated: me.meta.as_meta().as_map().clone(),
                         deleted: Vec::new(),
                     };
-                    if member_patch.is_empty() {
-                        party_fut.await?;
-                    } else {
-                        tokio::try_join!(party_fut, party.send_member_patch(member_patch))?;
+                    if !member_patch.is_empty() {
+                        party.send_member_patch(member_patch).await?;
                     }
-                } else {
-                    party_fut.await?;
                 }
             }
             Ok::<_, RustfnError>(())

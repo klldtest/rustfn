@@ -17,5 +17,3 @@ pub use fortnite::{
     extract_authorization_code, grant_eos_external_auth, open_url_in_browser,
     refresh_eos_token, revoke_eos_token, verify_epic_token, verify_eos_token,
 };
-
-pub use crate::client::SessionAuth;

@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use crate::http::{HTTP, FriendsSummaryResponse};
 use crate::protocol::{
-    AccountId, AwayStatus, CacheConfig, Platform, PresenceOnlineType, PresencePropValue,
-    PresencePropsMap, RustfnError, XMPPPresenceStatusPayload,
+    AccountId, AwayStatus, CacheConfig, EOS_EAS_DEPLOYMENT_ID, Platform, PresenceOnlineType,
+    PresencePropValue, PresencePropsMap, RustfnError, XMPPPresenceStatusPayload,
 };
 use crate::stomp::EOSPresenceUpdatePayload;
 use crate::users::{UserManager, UserProfile};
@@ -111,8 +111,6 @@ pub struct PartyJoinInfoData {
 struct FortBasicInfoProp {
     #[serde(default)]
     source_platform: Option<String>,
-    #[serde(default)]
-    home_base_rating: Option<i32>,
 }
 
 /// Friend presence from XMPP or EOS Connect.
@@ -184,10 +182,20 @@ impl FriendPresence {
         let selected = payload
             .per_ns
             .iter()
-            .find(|ns| ns.ns == "fn")
+            .find(|ns| {
+                ns.product_id
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case("Fortnite"))
+                    || ns.ns == EOS_EAS_DEPLOYMENT_ID
+                    || ns.ns == "fn"
+            })
             .or_else(|| payload.per_ns.first());
 
-        let online_type = selected.map(|s| s.status).unwrap_or(payload.status);
+        let online_type = if payload.status == PresenceOnlineType::Offline {
+            PresenceOnlineType::Offline
+        } else {
+            selected.map(|s| s.status).unwrap_or(payload.status)
+        };
         let away_status = match online_type {
             PresenceOnlineType::Away => AwayStatus::Away,
             PresenceOnlineType::Xa => AwayStatus::ExtendedAway,
@@ -205,10 +213,7 @@ impl FriendPresence {
             platform: None,
             product_name: selected.and_then(|s| s.product_id.clone()),
             session_id: None,
-            is_playing: selected
-                .and_then(|s| s.product_id.as_deref())
-                .is_some_and(|pid| pid.eq_ignore_ascii_case("Fortnite"))
-                || online_type != PresenceOnlineType::Offline,
+            is_playing: false,
             is_joinable: false,
             party_size: None,
             sub_game: None,
@@ -224,6 +229,12 @@ impl FriendPresence {
         if let Some(ns) = selected {
             let decoded = ns.decoded_props();
             presence.apply_decoded_props(&decoded);
+            presence.is_playing = presence.is_in_zone.unwrap_or_else(|| {
+                ns.product_id
+                    .as_deref()
+                    .is_some_and(|pid| pid.eq_ignore_ascii_case("Fortnite"))
+                    && online_type != PresenceOnlineType::Offline
+            });
             presence.is_joinable = presence.party_join_info.is_some()
                 && presence
                     .party_join_info
@@ -231,8 +242,10 @@ impl FriendPresence {
                     .and_then(|info| info.not_accepting_members_reason)
                     .unwrap_or(0)
                     == 0;
-            if let Some(PresencePropValue::Str(plat)) = decoded.get("EOS_Platform") {
-                presence.platform = parse_platform_loose(plat);
+            if let Some(PresencePropValue::Str(plat) | PresencePropValue::RawStr(plat)) =
+                decoded.get("EOS_Platform")
+            {
+                presence.platform = parse_known_platform(plat).or(presence.platform);
             }
         }
         presence
@@ -257,7 +270,7 @@ impl FriendPresence {
                 .or_else(|| join_val.get("pc").and_then(Value::as_u64).map(|n| n as u32));
 
             if let Some(ref plat) = parsed.source_platform {
-                self.platform = parse_platform_loose(plat);
+                self.platform = parse_known_platform(plat);
             }
             let is_private = join_val
                 .get("bIsPrivate")
@@ -273,14 +286,16 @@ impl FriendPresence {
             && self.platform.is_none()
             && let Some(ref plat) = parsed.source_platform
         {
-            self.platform = parse_platform_loose(plat);
+            self.platform = parse_known_platform(plat);
         }
 
         self.party_size = prop("FortPartySize", "FortPartySize_i").and_then(Value::as_i64);
-        self.sub_game = prop("FortSubGame", "FortSubGame_s").map(|v| match v {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        });
+        self.sub_game = prop("FortSubGame", "FortSubGame_s")
+            .or_else(|| props.get("FortSubGame_i"))
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            });
         self.island_code = prop("IslandCode", "IslandCode_s")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
@@ -288,8 +303,12 @@ impl FriendPresence {
         self.in_unjoinable_match =
             prop("InUnjoinableMatch", "InUnjoinableMatch_b").and_then(Value::as_bool);
         self.social_status = prop("SocialStatus", "SocialStatus_s")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
+            .or_else(|| props.get("SocialStatus_j"))
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Object(_) => Some(v.to_string()),
+                _ => None,
+            });
     }
 
     fn apply_decoded_props(&mut self, decoded: &BTreeMap<String, PresencePropValue>) {
@@ -483,8 +502,13 @@ pub fn build_xmpp_status_payload(spec: &OutboundPresenceSpec) -> XMPPPresenceSta
     }
 }
 
-fn parse_platform_loose(raw: &str) -> Option<Platform> {
-    serde_json::from_value(Value::String(raw.trim().to_owned())).ok()
+fn parse_known_platform(raw: &str) -> Option<Platform> {
+    let parsed: Platform = serde_json::from_value(Value::String(raw.trim().to_owned())).ok()?;
+    if parsed == Platform::Unknown {
+        None
+    } else {
+        Some(parsed)
+    }
 }
 
 /// Friend state changes produced by realtime notifications.

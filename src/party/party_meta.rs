@@ -1,6 +1,7 @@
 use crate::protocol::{
     AccountId, FortnitePartyPrivacy, InviteRestriction, MetaMap, MetaPatch, PartyId,
-    PartyPrivacyPreset, PartyType, Region, RustfnError, SquadPositionPriority, meta_codec::keys,
+    PartyPrivacyPreset, PartyType, Playlist, Region, RustfnError, SquadPositionPriority,
+    meta_codec::keys,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -295,7 +296,7 @@ impl PartyMeta {
             KEY_PLAYLIST_DATA_J,
             &json!({
                 "PlaylistData": {
-                    "playlistName": "Playlist_DefaultSquad",
+                    "playlistName": Playlist::DEFAULT_SQUAD,
                     "tournamentId": "",
                     "eventWindowId": "",
                     "linkId": { "mnemonic": DEFAULT_PLAYLIST_MNEMONIC, "version": -1 },

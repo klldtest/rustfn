@@ -4,7 +4,7 @@ use crate::http::{
     PublicKeyResponse,
 };
 use crate::protocol::{AccountId, PartyId, Platform, RustfnError};
-use crate::xmpp::{XMPP, chat_message_frame};
+use crate::xmpp::{XMPP, XMPPCommand};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -13,6 +13,7 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -87,7 +88,7 @@ pub struct SignedChatPayload {
     pub body_base64: String,
     pub signature_base64: String,
     pub pub_jwt: String,
-    pub timestamp_secs: u64,
+    pub timestamp_ms: u64,
 }
 
 /// Ephemeral per-session Ed25519 keypair registered against Epic's PublicKey service.
@@ -164,15 +165,15 @@ impl SignedChatKeypair {
             RustfnError::Auth("Ed25519 chat keypair has not been registered yet".to_owned())
         })?;
 
-        let message_id = Uuid::new_v4().simple().to_string();
-        let timestamp_secs = Utc::now().timestamp().max(0) as u64;
+        let message_id = Uuid::new_v4().to_string();
+        let timestamp_ms = Utc::now().timestamp_millis().max(0) as u64;
 
         let inner = SignedChatInnerPayload {
             mid: &message_id,
             sid: sender_id.as_str(),
             rid: conversation_id,
             msg: content,
-            tst: timestamp_secs,
+            tst: timestamp_ms,
             seq: sequence,
             rec: false,
             mts: [],
@@ -194,7 +195,7 @@ impl SignedChatKeypair {
             body_base64,
             signature_base64,
             pub_jwt: reg.jwt.clone(),
-            timestamp_secs,
+            timestamp_ms,
         })
     }
 }
@@ -248,67 +249,22 @@ pub fn decode_stomp_message_body(raw_body: &str) -> String {
     trimmed.to_owned()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        ChatSignedType, SignedChatKeypair, decode_stomp_message_body, verify_signed_message,
-    };
-    use crate::http::PublicKeyResponse;
-    use crate::protocol::AccountId;
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-    use serde_json::Value;
-
-    #[test]
-    fn signs_with_trailing_nul_and_verifies_ed25519_payload() {
-        let mut kp = SignedChatKeypair::from_secret_bytes(&[7u8; 32]);
-        kp.registration = Some(PublicKeyResponse {
-            key: kp.public_key_b64().to_owned(),
-            algorithm: "ed25519".to_owned(),
-            jwt: "jwt-token".to_owned(),
-            key_guid: Some("guid-1".to_owned()),
-        });
-
-        let sender = AccountId::parse("11111111111111111111111111111111").expect("valid account id");
-        let signed = kp
-            .sign_message(
-                &sender,
-                "ep-abcdef1234",
-                "hello squad",
-                ChatSignedType::Persistent,
-                1,
-            )
-            .expect("sign succeeds");
-
-        verify_signed_message(kp.public_key_b64(), &signed.body_base64, &signed.signature_base64)
-            .expect("signature verifies against body || 0x00");
-
-        let decoded_bytes = BASE64_STANDARD
-            .decode(&signed.body_base64)
-            .expect("valid base64 body");
-        let parsed: Value = serde_json::from_slice(&decoded_bytes).expect("valid json payload");
-        assert_eq!(parsed["sid"], "11111111111111111111111111111111");
-        assert_eq!(parsed["rid"], "ep-abcdef1234");
-        assert_eq!(parsed["msg"], "hello squad");
-        assert_eq!(parsed["cty"], "Persistent");
-        assert_eq!(parsed["seq"], 1);
-        assert_eq!(parsed["rec"], false);
-
-        assert_eq!(decode_stomp_message_body(&signed.body_base64), "hello squad");
-    }
-
-    #[test]
-    fn decodes_plain_and_legacy_message_bodies() {
-        assert_eq!(decode_stomp_message_body(""), "");
-        let plain_b64 = BASE64_STANDARD.encode("plain message\0\0");
-        assert_eq!(decode_stomp_message_body(&plain_b64), "plain message");
-        assert_eq!(decode_stomp_message_body("legacy raw text!"), "legacy raw text!");
-    }
-}
-
 #[derive(Debug, Clone)]
 struct DmConversationEntry {
     conversation_id: String,
     is_reportable: bool,
+}
+
+struct SignedMessageSpec<'a> {
+    scope: &'a str,
+    addressed_conv: &'a str,
+    signed_conv: &'a str,
+    chat_type: ChatSignedType,
+    sequence: u64,
+    allowed_recipients: Vec<AccountId>,
+    is_reportable: bool,
+    npm: Option<String>,
+    content: &'a str,
 }
 
 /// Result returned when delivering an outbound EOS party chat message.
@@ -330,6 +286,7 @@ pub struct ChatManager {
     friends: Arc<FriendManager>,
     keypair: Mutex<SignedChatKeypair>,
     dm_conversations: DashMap<AccountId, DmConversationEntry>,
+    next_seq: AtomicU64,
 }
 
 impl ChatManager {
@@ -352,7 +309,12 @@ impl ChatManager {
             friends,
             keypair: Mutex::new(SignedChatKeypair::generate()),
             dm_conversations: DashMap::new(),
+            next_seq: AtomicU64::new(1),
         })
+    }
+
+    fn alloc_seq(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     pub async fn ensure_keypair_registered(&self) -> Result<(), RustfnError> {
@@ -458,34 +420,35 @@ impl ChatManager {
             .cloned()
             .collect();
 
+        let seq = self.alloc_seq();
         let msg_id = match self
-            .send_signed_message(
-                &scope,
-                &addressed_conv,
-                &signed_conv,
+            .send_signed_message(SignedMessageSpec {
+                scope: &scope,
+                addressed_conv: &addressed_conv,
+                signed_conv: &signed_conv,
                 chat_type,
-                1,
-                allowed_recipients.clone(),
-                reportable,
-                Some("1".to_owned()),
+                sequence: seq,
+                allowed_recipients: allowed_recipients.clone(),
+                is_reportable: reportable,
+                npm: Some("1".to_owned()),
                 content,
-            )
+            })
             .await
         {
             Ok(msg_id) => msg_id,
             Err(err) if is_reportable_mismatch(&err) => {
                 reportable = is_reportable_expected(&err).unwrap_or(!reportable);
-                self.send_signed_message(
-                    &scope,
-                    &addressed_conv,
-                    &signed_conv,
+                self.send_signed_message(SignedMessageSpec {
+                    scope: &scope,
+                    addressed_conv: &addressed_conv,
+                    signed_conv: &signed_conv,
                     chat_type,
-                    1,
+                    sequence: self.alloc_seq(),
                     allowed_recipients,
-                    reportable,
-                    Some("1".to_owned()),
+                    is_reportable: reportable,
+                    npm: Some("1".to_owned()),
                     content,
-                )
+                })
                 .await?
             }
             Err(err) => return Err(err),
@@ -526,8 +489,12 @@ impl ChatManager {
     ) -> Result<(), RustfnError> {
         let to_jid = format!("{}@{}", recipient_id.as_str(), self.xmpp_domain);
         let msg_id = Uuid::new_v4().simple().to_string();
-        let xml = chat_message_frame(&to_jid, &msg_id, content);
-        xmpp.send_stanza(xml).await
+        xmpp.send_command(XMPPCommand::SendChat {
+            to_jid,
+            id: msg_id,
+            body: content.to_owned(),
+        })
+        .await
     }
 
     async fn resolve_dm_conversation(
@@ -560,17 +527,17 @@ impl ChatManager {
     ) -> Result<SentFriendMessage, RustfnError> {
         let allowed = vec![recipient_id.clone(), self.self_id.clone()];
         let message_id = self
-            .send_signed_message(
-                "_",
-                &entry.conversation_id,
-                &entry.conversation_id,
-                ChatSignedType::Persistent,
-                0,
-                allowed,
-                entry.is_reportable,
-                None,
+            .send_signed_message(SignedMessageSpec {
+                scope: "_",
+                addressed_conv: &entry.conversation_id,
+                signed_conv: &entry.conversation_id,
+                chat_type: ChatSignedType::Persistent,
+                sequence: self.alloc_seq(),
+                allowed_recipients: allowed,
+                is_reportable: entry.is_reportable,
+                npm: None,
                 content,
-            )
+            })
             .await?;
 
         Ok(SentFriendMessage {
@@ -582,34 +549,27 @@ impl ChatManager {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn send_signed_message(
-        &self,
-        scope: &str,
-        addressed_conv: &str,
-        signed_conv: &str,
-        chat_type: ChatSignedType,
-        sequence: u64,
-        allowed_recipients: Vec<AccountId>,
-        is_reportable: bool,
-        npm: Option<String>,
-        content: &str,
-    ) -> Result<String, RustfnError> {
+    async fn send_signed_message(&self, spec: SignedMessageSpec<'_>) -> Result<String, RustfnError> {
         let signed = self
-            .sign_with_registered_key(signed_conv, content, chat_type, sequence)
+            .sign_with_registered_key(
+                spec.signed_conv,
+                spec.content,
+                spec.chat_type,
+                spec.sequence,
+            )
             .await?;
 
         let request = ChatSendMessageRequest {
-            allowed_recipients,
+            allowed_recipients: spec.allowed_recipients,
             message: ChatSendMessageBody {
                 body: signed.body_base64,
             },
-            is_reportable,
+            is_reportable: spec.is_reportable,
             metadata: ChatMessageMetadata {
                 tm_v: "2".to_owned(),
                 pub_jwt: signed.pub_jwt,
                 sig: signed.signature_base64,
-                npm,
+                npm: spec.npm,
                 plf_nm: self.platform.as_str().to_owned(),
                 plf_id: self.self_id.as_str().to_owned(),
             },
@@ -617,7 +577,7 @@ impl ChatManager {
 
         let resp = self
             .http
-            .send_eos_conversation_message(scope, addressed_conv, &self.self_id, &request)
+            .send_eos_conversation_message(spec.scope, spec.addressed_conv, &self.self_id, &request)
             .await?;
         Ok(resp.message_id.unwrap_or(signed.message_id))
     }
@@ -656,5 +616,64 @@ fn is_reportable_expected(err: &RustfnError) -> Option<bool> {
         Some(false)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ChatSignedType, SignedChatKeypair, decode_stomp_message_body, verify_signed_message,
+    };
+    use crate::http::PublicKeyResponse;
+    use crate::protocol::AccountId;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use serde_json::Value;
+
+    #[test]
+    fn signs_with_trailing_nul_and_verifies_ed25519_payload() {
+        let mut kp = SignedChatKeypair::from_secret_bytes(&[7u8; 32]);
+        kp.registration = Some(PublicKeyResponse {
+            key: kp.public_key_b64().to_owned(),
+            algorithm: "ed25519".to_owned(),
+            jwt: "jwt-token".to_owned(),
+            key_guid: Some("guid-1".to_owned()),
+        });
+
+        let sender = AccountId::parse("11111111111111111111111111111111").expect("valid account id");
+        let signed = kp
+            .sign_message(
+                &sender,
+                "ep-abcdef1234",
+                "hello squad",
+                ChatSignedType::Persistent,
+                1,
+            )
+            .expect("sign succeeds");
+
+        verify_signed_message(kp.public_key_b64(), &signed.body_base64, &signed.signature_base64)
+            .expect("signature verifies against body || 0x00");
+
+        let decoded_bytes = BASE64_STANDARD
+            .decode(&signed.body_base64)
+            .expect("valid base64 body");
+        let parsed: Value = serde_json::from_slice(&decoded_bytes).expect("valid json payload");
+        assert_eq!(parsed["sid"], "11111111111111111111111111111111");
+        assert_eq!(parsed["rid"], "ep-abcdef1234");
+        assert_eq!(parsed["msg"], "hello squad");
+        assert_eq!(parsed["cty"], "Persistent");
+        assert_eq!(parsed["seq"], 1);
+        assert_eq!(parsed["rec"], false);
+        assert!(parsed["tst"].as_u64().unwrap_or(0) > 1_000_000_000_000);
+        assert!(parsed["mid"].as_str().unwrap_or("").contains('-'));
+
+        assert_eq!(decode_stomp_message_body(&signed.body_base64), "hello squad");
+    }
+
+    #[test]
+    fn decodes_plain_and_legacy_message_bodies() {
+        assert_eq!(decode_stomp_message_body(""), "");
+        let plain_b64 = BASE64_STANDARD.encode("plain message\0\0");
+        assert_eq!(decode_stomp_message_body(&plain_b64), "plain message");
+        assert_eq!(decode_stomp_message_body("legacy raw text!"), "legacy raw text!");
     }
 }

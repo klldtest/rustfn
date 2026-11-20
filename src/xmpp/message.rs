@@ -76,7 +76,7 @@ pub struct XMPPPartyMemberDeltaNotification {
     pub member_state_removed: Vec<String>,
 }
 
-/// Party membership lifecycle notification (`MEMBER_LEFT`, `MEMBER_EXPIRED`, `MEMBER_KICKED`, `MEMBER_NEW_CAPTAIN`, `MEMBER_DISCONNECTED`).
+/// Party member event notification (`MEMBER_LEFT`, `MEMBER_EXPIRED`, `MEMBER_KICKED`, `MEMBER_NEW_CAPTAIN`, `MEMBER_DISCONNECTED`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct XMPPPartyMemberEventNotification {
     pub party_id: PartyId,

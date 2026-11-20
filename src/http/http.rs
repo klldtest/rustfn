@@ -274,9 +274,13 @@ impl HttpClient {
             }
 
             let mut used_bearer: Option<SecretString> = None;
-            let mut builder = self.inner.request(spec.method.clone(), &spec.url)
-                .header(USER_AGENT, &self.config.user_agent)
-                .header(ACCEPT_LANGUAGE, &self.config.accept_language);
+            let mut builder = self.inner.request(spec.method.clone(), &spec.url);
+            if !spec.headers.contains_key(USER_AGENT) {
+                builder = builder.header(USER_AGENT, &self.config.user_agent);
+            }
+            if !spec.headers.contains_key(ACCEPT_LANGUAGE) {
+                builder = builder.header(ACCEPT_LANGUAGE, &self.config.accept_language);
+            }
 
             for (name, value) in &spec.headers {
                 builder = builder.header(name, value);
@@ -344,7 +348,6 @@ impl HttpClient {
                 });
             }
 
-            tries += 1;
             let parsed_epic_error = parse_epic_error(&body);
 
             if !auth_retried
@@ -364,6 +367,8 @@ impl HttpClient {
                 auth_retried = true;
                 continue;
             }
+
+            tries += 1;
 
             let is_throttled = status.as_u16() == 429
                 || parsed_epic_error
@@ -402,8 +407,20 @@ impl HttpClient {
                 } else if retry.handle_capacity_throttling {
                     let wait = next_backoff(&mut backoff, retry.backoff_factor, retry.backoff_cap);
                     if wait <= retry.backoff_cap && total_slept + wait <= retry.max_wait_time {
+                        check_retry_hook(
+                            spec.retry_decision.as_ref(),
+                            status.as_u16(),
+                            &parsed_epic_error,
+                            &body,
+                        )?;
                         total_slept += wait;
                         tokio::time::sleep(wait).await;
+                        check_retry_hook(
+                            spec.retry_decision.as_ref(),
+                            status.as_u16(),
+                            &parsed_epic_error,
+                            &body,
+                        )?;
                         continue;
                     }
                 }
@@ -416,8 +433,20 @@ impl HttpClient {
             {
                 let wait = Duration::from_millis(500) + Duration::from_secs(2 * (tries as u64 - 1));
                 if total_slept + wait <= retry.max_wait_time {
+                    check_retry_hook(
+                        spec.retry_decision.as_ref(),
+                        status.as_u16(),
+                        &parsed_epic_error,
+                        &body,
+                    )?;
                     total_slept += wait;
                     tokio::time::sleep(wait).await;
+                    check_retry_hook(
+                        spec.retry_decision.as_ref(),
+                        status.as_u16(),
+                        &parsed_epic_error,
+                        &body,
+                    )?;
                     continue;
                 }
             }
@@ -426,8 +455,20 @@ impl HttpClient {
                 rest_5xx_retries += 1;
                 let wait = next_backoff(&mut backoff, retry.backoff_factor, retry.backoff_cap);
                 if total_slept + wait <= retry.max_wait_time {
+                    check_retry_hook(
+                        spec.retry_decision.as_ref(),
+                        status.as_u16(),
+                        &parsed_epic_error,
+                        &body,
+                    )?;
                     total_slept += wait;
                     tokio::time::sleep(wait).await;
+                    check_retry_hook(
+                        spec.retry_decision.as_ref(),
+                        status.as_u16(),
+                        &parsed_epic_error,
+                        &body,
+                    )?;
                     continue;
                 }
             }

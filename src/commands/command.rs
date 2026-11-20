@@ -13,13 +13,14 @@ pub type CommandCallback = Arc<dyn Fn(Context) -> BoxBotFuture + Send + Sync>;
 pub type CommandErrorFn =
     Arc<dyn Fn(Context, Arc<CommandError>) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 pub type CommandHookFn = Arc<dyn Fn(Context) -> BoxBotFuture + Send + Sync>;
+pub type DynamicPrefixFn = Arc<dyn Fn(&IncomingMessage) -> Vec<String> + Send + Sync>;
 
 /// Prefix specification matching string, multi-prefix list, or dynamic resolver.
 #[derive(Clone)]
 pub enum PrefixConfig {
     Single(String),
     Multiple(Vec<String>),
-    Dynamic(Arc<dyn Fn(&IncomingMessage) -> Vec<String> + Send + Sync>),
+    Dynamic(DynamicPrefixFn),
 }
 
 impl Default for PrefixConfig {
@@ -421,13 +422,6 @@ impl CommandMap {
     pub fn remove(&mut self, name: &str) -> Option<Arc<Command>> {
         let key = self.normalize(name);
         let removed = self.by_key.remove(&key)?;
-        if removed
-            .aliases
-            .iter()
-            .any(|alias| self.normalize(alias) == key)
-        {
-            return Some(removed);
-        }
         let primary_key = self.normalize(&removed.name);
         self.by_key.remove(&primary_key);
         for alias in &removed.aliases {

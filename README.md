@@ -2,6 +2,9 @@
 
 Async Rust client for Epic Online Services and Fortnite.
 
+> [!NOTE]
+> `rustfn` is currently in the development and testing phase. Everything is actively being tested and refined.
+> 
 ## Features
 
 - Device code sign-in and saved DeviceAuth credentials.
@@ -28,7 +31,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 Save this as `src/main.rs`:
 
 ```rust
-use rustfn::commands::Bot;
+use rustfn::Bot;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

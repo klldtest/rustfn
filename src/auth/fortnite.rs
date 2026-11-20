@@ -18,7 +18,6 @@ use std::future::Future;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EulaCheckOutcome {
@@ -45,14 +44,14 @@ pub fn extract_authorization_code(input: &str) -> Result<SecretString, RustfnErr
             .ok_or_else(|| {
                 RustfnError::Auth("redirect URL does not contain `code` parameter".to_owned())
             })?;
-        return Ok(SecretString::from(Zeroizing::new(code).as_str()));
+        return Ok(SecretString::from(code));
     }
 
     if trimmed.is_empty() {
         return Err(RustfnError::Auth("authorization code must not be empty".to_owned()));
     }
 
-    Ok(SecretString::from(Zeroizing::new(trimmed.to_owned()).as_str()))
+    Ok(SecretString::from(trimmed.to_owned()))
 }
 
 pub async fn oauth_grant_epic(

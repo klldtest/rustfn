@@ -249,15 +249,13 @@ impl AuthSessionStore {
 pub fn deserialize_secret_string<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<SecretString, D::Error> {
-    let raw = Zeroizing::new(String::deserialize(deserializer)?);
-    Ok(SecretString::from(raw.as_str()))
+    Ok(SecretString::from(String::deserialize(deserializer)?))
 }
 
 pub fn deserialize_opt_secret_string<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<SecretString>, D::Error> {
-    Ok(Option::<String>::deserialize(deserializer)?
-        .map(|s| SecretString::from(Zeroizing::new(s).as_str())))
+    Ok(Option::<String>::deserialize(deserializer)?.map(SecretString::from))
 }
 
 #[derive(Clone, Deserialize)]

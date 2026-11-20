@@ -67,10 +67,12 @@ impl Cooldown {
         }
 
         self.tokens -= 1;
-        if self.tokens == 0 {
-            self.window_start = Some(now);
-        }
         None
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        self.window_start
+            .is_some_and(|start| now.saturating_duration_since(start) > self.per)
     }
 
     pub fn reset(&mut self) {
@@ -95,6 +97,14 @@ impl CooldownMapping {
     }
 
     pub async fn update_rate_limit(&self, author_id: &AccountId) -> Option<Duration> {
+        let now = Instant::now();
+        if self.buckets.len() > 64 {
+            self.buckets.retain(|_, v| {
+                v.try_lock()
+                    .map(|cd| !cd.is_expired(now))
+                    .unwrap_or(true)
+            });
+        }
         let key = self.original.bucket.key_for(author_id);
         let bucket = self
             .buckets
@@ -103,7 +113,7 @@ impl CooldownMapping {
             .value()
             .clone();
         let mut cooldown = bucket.lock().await;
-        cooldown.update_rate_limit(Instant::now())
+        cooldown.update_rate_limit(now)
     }
 
     pub fn reset_all(&self) {

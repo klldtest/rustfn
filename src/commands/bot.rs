@@ -26,7 +26,8 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 
 type ReadyHandler = Arc<dyn Fn(ReadyContext) -> BoxBotFuture + Send + Sync>;
 type FriendRequestHandler = Arc<dyn Fn(FriendRequestContext) -> BoxBotFuture + Send + Sync>;
@@ -390,17 +391,10 @@ impl Bot {
         self
     }
 
-    /// Builds [`Client`], authenticates, processes events until `Enter` or `Ctrl+C`, and logs out cleanly.
+    /// Builds [`Client`], authenticates, processes events until `Ctrl+C`, and logs out cleanly.
     pub async fn run(self) -> Result<(), RustfnError> {
-        let enter_fut = tokio::task::spawn_blocking(|| {
-            let mut line = String::new();
-            let _ = std::io::stdin().read_line(&mut line);
-        });
-        self.run_until(async move {
-            tokio::select! {
-                _ = enter_fut => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
+        self.run_until(async {
+            let _ = tokio::signal::ctrl_c().await;
         })
         .await
     }
@@ -432,24 +426,30 @@ impl Bot {
         });
 
         let events = client.subscribe_events();
-        let loop_task = spawn_bot_event_loop(events, runtime);
+        let loop_cancel = CancellationToken::new();
+        let loop_task = spawn_bot_event_loop(events, runtime, loop_cancel.clone());
 
-        match auth {
+        let login_res = match auth {
             AuthMethod::DeviceCode => {
-                Box::pin(client.authenticate_device_code(DeviceCodeAuth::new())).await?;
+                Box::pin(client.authenticate_device_code(DeviceCodeAuth::new())).await
             }
             AuthMethod::DeviceCodeAuth(cfg) => {
-                Box::pin(client.authenticate_device_code(cfg)).await?;
+                Box::pin(client.authenticate_device_code(cfg)).await
             }
-            other => {
-                Box::pin(client.login(other)).await?;
-            }
+            other => Box::pin(client.login(other)).await,
+        };
+
+        if let Err(err) = login_res {
+            loop_cancel.cancel();
+            let _ = loop_task.await;
+            return Err(err);
         }
 
-        println!("Bot running. Press Enter or Ctrl+C to log out.");
+        info!("bot running");
         shutdown.await;
-        println!("Shutting down...");
+        info!("bot shutting down");
         let logout_res = client.logout().await;
+        loop_cancel.cancel();
         let _ = loop_task.await;
         logout_res
     }
@@ -486,7 +486,8 @@ impl BotRuntime {
         let mut view = StringView::new(&message.content);
         let mut ctx = Context::new(self.handle.clone(), message.clone(), view.clone());
 
-        let prefixes = self.get_prefix(&message);
+        let mut prefixes = self.get_prefix(&message);
+        prefixes.sort_by_key(|p| std::cmp::Reverse(p.len()));
         let matched_prefix = prefixes
             .into_iter()
             .find(|prefix| !prefix.is_empty() && view.skip_string(prefix)
@@ -724,7 +725,7 @@ impl BotRuntime {
         if let Some(global_error) = &self.handlers.on_command_error {
             global_error(ctx, err).await;
         } else if !matches!(&*err, CommandError::CommandNotFound(_)) {
-            eprintln!("Ignoring error in command {:?}: {err}", ctx.command_name);
+            warn!(command = ?ctx.command_name, error = %err, "unhandled command error");
         }
     }
 
@@ -739,21 +740,25 @@ impl BotRuntime {
 fn spawn_bot_event_loop(
     mut events: broadcast::Receiver<Arc<ClientEvent>>,
     runtime: Arc<BotRuntime>,
+    cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match events.recv().await {
-                Ok(event) => {
-                    let disconnected = matches!(&*event, ClientEvent::Disconnected);
-                    handle_event(&runtime, event).await;
-                    if disconnected {
-                        break;
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                recv = events.recv() => match recv {
+                    Ok(event) => {
+                        let disconnected = matches!(&*event, ClientEvent::Disconnected);
+                        handle_event(&runtime, event).await;
+                        if disconnected {
+                            break;
+                        }
                     }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "bot event loop lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "bot event loop lagged");
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     })
@@ -766,13 +771,14 @@ async fn handle_event(runtime: &Arc<BotRuntime>, event: Arc<ClientEvent>) {
             user_code,
             ..
         } => {
-            println!("Open browser to sign in ({user_code}): {verification_uri_complete}");
+            info!(
+                user_code = %user_code,
+                verification_uri = %verification_uri_complete,
+                "open browser to complete device-code sign-in"
+            );
         }
         ClientEvent::Auth(AuthEvent::DeviceAuthCreated(creds)) => {
-            println!(
-                "Saved DeviceAuth for {} (future runs log in automatically)",
-                creds.account_id
-            );
+            info!(account_id = %creds.account_id, "saved DeviceAuth credentials");
         }
         ClientEvent::Ready {
             account_id,
@@ -856,10 +862,19 @@ async fn handle_event(runtime: &Arc<BotRuntime>, event: Arc<ClientEvent>) {
             });
         }
         ClientEvent::PartyMessage(msg) => {
+            let author_display_name = if let Some(party) = runtime.handle.client().party().await {
+                party.snapshot().await.and_then(|snap| {
+                    snap.members
+                        .get(&msg.author_id)
+                        .and_then(|m| m.display_name.clone())
+                })
+            } else {
+                None
+            };
             let normalized = IncomingMessage {
                 message_id: msg.id.clone().unwrap_or_else(|| msg.timestamp_ms.to_string()),
                 author_id: msg.author_id.clone(),
-                author_display_name: None,
+                author_display_name,
                 content: msg.content.clone(),
                 channel: MessageChannel::Party(msg.party_id.clone()),
             };
@@ -880,7 +895,6 @@ fn spawn_bot_future(fut: BoxBotFuture, label: &'static str) {
     tokio::spawn(async move {
         if let Err(err) = fut.await {
             warn!(handler = label, error = %err, "bot callback returned error");
-            eprintln!("Bot {label} error: {err}");
         }
     });
 }
@@ -900,7 +914,7 @@ fn default_bot_auth(device_dir: &Path) -> Result<AuthMethod, RustfnError> {
     }
 
     if let Some(creds) = load_first_device_auth(device_dir) {
-        println!("Loaded saved DeviceAuth for {}", creds.account_id);
+        info!(account_id = %creds.account_id, "loaded saved DeviceAuth");
         return Ok(AuthMethod::DeviceAuth(creds));
     }
 

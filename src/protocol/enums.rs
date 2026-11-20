@@ -392,15 +392,6 @@ pub enum UserSearchMatchType {
 }
 
 /// Auth session token families managed by the auth module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthSessionType {
-    #[default]
-    Account,
-    ClientCredentials,
-    Eos,
-}
-
 /// Chat transport channels across XMPP and EOS Chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -418,15 +409,6 @@ pub enum ConversationType {
         alias = "Persistent"
     )]
     PartyChat,
-}
-
-/// Signed EOS party/chat message categories.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SignedMessageType {
-    MemberIntent,
-    PartyUpdate,
-    System,
 }
 
 /// Preserves any playlist ID, including ones introduced in future updates.

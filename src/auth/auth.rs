@@ -137,7 +137,7 @@ pub enum AuthEvent {
     DeviceAuthCreated(DeviceAuthCredentials),
     LauncherRefreshTokenCreated {
         account_id: Option<AccountId>,
-        refresh_token: String,
+        refresh_token: SecretString,
     },
     SessionRefreshed {
         slot: AuthSessionSlot,
@@ -251,7 +251,7 @@ impl AuthTokenCoordinator {
                         {
                             let _ = self.event_tx.send(AuthEvent::LauncherRefreshTokenCreated {
                                 account_id: updated.account_id.clone(),
-                                refresh_token: rt.expose_secret().to_owned(),
+                                refresh_token: rt.clone(),
                             });
                         }
                         updated
@@ -364,7 +364,7 @@ impl TokenProvider for AuthTokenCoordinator {
     }
 }
 
-/// High-level OAuth2/EOS lifecycle manager for a single Epic Games account.
+/// OAuth2/EOS session manager for a single Epic Games account.
 pub struct Auth {
     config: AuthConfig,
     http_raw: HttpClient,
@@ -432,20 +432,6 @@ impl Auth {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<AuthEvent> {
         self.event_tx.subscribe()
-    }
-
-    /// Attempts persisted [`DeviceAuthCredentials`] first if available on disk, falling back to `fallback`.
-    pub async fn authenticate_with_store_or(
-        &self,
-        account_id: Option<&AccountId>,
-        fallback: AuthMethod,
-    ) -> Result<(), RustfnError> {
-        if let (Some(store), Some(id)) = (self.config.device_store.as_ref(), account_id)
-            && let Some(creds) = store.load(id).await?
-        {
-            return self.authenticate(AuthMethod::DeviceAuth(creds)).await;
-        }
-        self.authenticate(fallback).await
     }
 
     pub async fn authenticate(&self, method: AuthMethod) -> Result<(), RustfnError> {
@@ -626,7 +612,7 @@ impl Auth {
             if let Some(rt) = launcher_stored.refresh_token.as_ref() {
                 let _ = self.event_tx.send(AuthEvent::LauncherRefreshTokenCreated {
                     account_id: launcher_stored.account_id.clone(),
-                    refresh_token: rt.expose_secret().to_owned(),
+                    refresh_token: rt.clone(),
                 });
             }
             self.store.insert_session(launcher_stored).await;

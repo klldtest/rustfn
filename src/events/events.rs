@@ -22,7 +22,7 @@ use crate::xmpp::{XMPPAdminMessage, XMPP, XMPPEvent};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
@@ -343,7 +343,8 @@ pub struct RealtimeEventContext {
     pub xmpp: Option<Arc<XMPP>>,
     pub stomp: Option<Arc<STOMP>>,
     pub party_slot: Arc<RwLock<Option<ClientParty>>>,
-    pub presence_permission: PresencePermission,
+    pub party_lock: Arc<Mutex<()>>,
+    pub default_presence_permission: PresencePermission,
 }
 
 impl RealtimeEventContext {
@@ -373,15 +374,19 @@ fn spawn_event_loop<T, F, Fut>(
 ) -> JoinHandle<()>
 where
     T: Clone + Send + Sync + 'static,
-    F: FnMut(RealtimeEventContext, T) -> Fut + Send + 'static,
+    F: FnMut(Arc<RealtimeEventContext>, T) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let ctx = Arc::new(ctx);
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 recv = rx.recv() => match recv {
-                    Ok(event) => handle(ctx.clone(), (*event).clone()).await,
+                    Ok(event) => {
+                        let unwrapped = Arc::try_unwrap(event).unwrap_or_else(|e| (*e).clone());
+                        handle(Arc::clone(&ctx), unwrapped).await;
+                    }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(account_id = %ctx.self_id, skipped, "{label} handler lagged behind broadcast buffer");
                     }
@@ -724,7 +729,15 @@ async fn handle_stomp_notification(
             }
         }
         EOSConnectNotification::PartyInviteCreated { payload, .. } => {
-            if matches!(ctx.presence_permission, PresencePermission::Noone) {
+            let active_perm = match ctx.party_slot.read().await.clone() {
+                Some(party) => party
+                    .snapshot()
+                    .await
+                    .map(|snap| snap.config.privacy.presence_permission)
+                    .unwrap_or(ctx.default_presence_permission),
+                None => ctx.default_presence_permission,
+            };
+            if matches!(active_perm, PresencePermission::Noone) {
                 trace!(party_id = %payload.party_id, "ignoring EOS invite under PresencePermission::Noone");
                 return;
             }
@@ -765,6 +778,7 @@ async fn handle_stomp_notification(
                 .emit(ClientEvent::PartyJoinRequestReceived(request));
         }
         EOSConnectNotification::PartyMemberJoined { payload, .. } => {
+            let _party_guard = ctx.party_lock.lock().await;
             if let Some(party) = ctx.party_for_eos(&payload.party_id).await {
                 if let Err(err) = party.handle_stomp_member_joined(payload).await {
                     debug!(error = %err, "failed to process STOMP MEMBER_JOINED");
@@ -826,11 +840,13 @@ async fn handle_stomp_member_removal(
     payload: EOSPartyMemberUpdateData,
     reason: MemberRemovalReason,
 ) {
+    let was_self = payload.account_id == ctx.self_id;
+    let eos_id = payload.party_id.clone();
+
+    let _party_guard = ctx.party_lock.lock().await;
     let Some(party) = ctx.party_for_eos(&payload.party_id).await else {
         return;
     };
-    let was_self = payload.account_id == ctx.self_id;
-    let eos_id = payload.party_id.clone();
 
     if let Err(err) = party.handle_stomp_member_removed(payload, reason).await {
         debug!(error = %err, ?reason, "failed to handle STOMP member removal");
@@ -841,14 +857,15 @@ async fn handle_stomp_member_removal(
         if slot_guard.as_ref().is_some_and(|p| p.eos_id() == &eos_id) {
             *slot_guard = None;
         }
-        drop(slot_guard);
     }
+    drop(_party_guard);
 
     sync_eos_internal_presence(ctx).await;
 }
 
 async fn handle_stomp_party_disbanded(ctx: &RealtimeEventContext, party_id: PartyId) {
     let disbanded = {
+        let _party_guard = ctx.party_lock.lock().await;
         let mut slot_guard = ctx.party_slot.write().await;
         if slot_guard.as_ref().is_some_and(|p| p.eos_id() == &party_id) {
             slot_guard.take()

@@ -718,8 +718,8 @@ impl HTTP {
         target_id: &AccountId,
     ) -> Result<(), RustfnError> {
         let url = format!(
-            "{}/{}/{}",
-            self.endpoints.friends_public.trim_end_matches('/'),
+            "{}/{}/friends/{}",
+            self.endpoints.friends.trim_end_matches('/'),
             client_id.as_str(),
             target_id.as_str()
         );
@@ -728,7 +728,7 @@ impl HTTP {
                 HttpRequestSpec::post(url)
                     .with_auth(AuthSessionSlot::Fortnite)
                     .with_account_scope(client_id.clone())
-                    .with_route_key("POST friends/public/{id}/{target}"),
+                    .with_route_key("POST friends/v1/{id}/friends/{target}"),
             )
             .await
     }
@@ -976,9 +976,19 @@ impl HTTP {
             scope,
             encoded_conv
         );
+        let correlation_id = format!(
+            "EOS-{}-{}",
+            chrono::Utc::now().timestamp_millis(),
+            uuid::Uuid::new_v4()
+        );
         let spec = HttpRequestSpec::post(url)
             .with_auth(AuthSessionSlot::FortniteEos)
             .with_query("fromAccountId", sender_id.as_str())
+            .with_header(
+                // `HeaderName::from_static` requires lowercase ASCII.
+                reqwest::header::HeaderName::from_static("x-epic-correlation-id"),
+                correlation_id,
+            )?
             .with_account_scope(sender_id.clone())
             .with_route_key("POST epic/chat/v1/public/{scope}/conversations/{id}/messages")
             .with_json(request)?;
@@ -1011,6 +1021,7 @@ impl HTTP {
         self.http.execute_empty(spec).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn patch_eos_presence(
         &self,
         deployment_id: &str,
@@ -1030,19 +1041,19 @@ impl HTTP {
             account_id.as_str(),
             encoded_conn
         );
-        let mut spec = HttpRequestSpec::patch(url)
-            .with_auth(AuthSessionSlot::FortniteEos)
-            .with_account_scope(account_id.clone())
-            .with_route_key("PATCH epic/presence/v1/{ns}/{id}/presence/{conn}")
-            .with_json(&json!({
-                "status": online_type,
-                "activity": { "value": activity_value },
-                "conn": { "props": {} },
-                "props": props,
-            }))?;
-        if let Some(hook) = retry_decision {
-            spec = spec.with_retry_decision(hook);
-        }
+        let spec = apply_retry(
+            HttpRequestSpec::patch(url)
+                .with_auth(AuthSessionSlot::FortniteEos)
+                .with_account_scope(account_id.clone())
+                .with_route_key("PATCH epic/presence/v1/{ns}/{id}/presence/{conn}")
+                .with_json(&json!({
+                    "status": online_type,
+                    "activity": { "value": activity_value },
+                    "conn": { "props": {} },
+                    "props": props,
+                }))?,
+            retry_decision,
+        );
         self.http.execute_empty(spec).await
     }
 
@@ -1070,14 +1081,14 @@ impl HTTP {
             payload["party"] = serde_json::to_value(party_info)?;
         }
 
-        let mut spec = HttpRequestSpec::patch(url)
-            .with_auth(AuthSessionSlot::FortniteEos)
-            .with_account_scope(account_id.clone())
-            .with_route_key("PATCH epic/presence/internal/v1/_/{id}/presence/{conn}")
-            .with_json(&payload)?;
-        if let Some(hook) = retry_decision {
-            spec = spec.with_retry_decision(hook);
-        }
+        let spec = apply_retry(
+            HttpRequestSpec::patch(url)
+                .with_auth(AuthSessionSlot::FortniteEos)
+                .with_account_scope(account_id.clone())
+                .with_route_key("PATCH epic/presence/internal/v1/_/{id}/presence/{conn}")
+                .with_json(&payload)?,
+            retry_decision,
+        );
         self.http.execute_empty(spec).await
     }
 
@@ -1374,6 +1385,7 @@ impl HTTP {
         self.http.execute_empty(spec).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn join_fn_lobby(
         &self,
         eos_party_id: &PartyId,
@@ -1560,53 +1572,6 @@ impl HTTP {
         self.http
             .execute_empty(apply_retry(spec, retry_decision))
             .await
-    }
-
-    pub async fn send_fn_party_invite(
-        &self,
-        party_id: &LobbyId,
-        target_id: &AccountId,
-        sender_display_name: &str,
-        platform: Platform,
-        party_build_id: &str,
-        send_ping: bool,
-    ) -> Result<(), RustfnError> {
-        let url = format!(
-            "{}/parties/{}/invites/{}",
-            self.endpoints.br_party.trim_end_matches('/'),
-            party_id.as_str(),
-            target_id.as_str(),
-        );
-        let guid = Uuid::new_v4().simple().to_string().to_ascii_uppercase();
-        let spec = HttpRequestSpec::post(url)
-            .with_auth(AuthSessionSlot::Fortnite)
-            .with_route_key("POST party/Fortnite/parties/{id}/invites/{id}")
-            .with_query("sendPing", if send_ping { "true" } else { "false" })
-            .with_json(&json!({
-                "urn:epic:invite:platformdata_s": format!("guid={guid}"),
-                "urn:epic:member:dn_s": sender_display_name,
-                "urn:epic:conn:platform_s": platform.as_str(),
-                "urn:epic:cfg:build-id_s": party_build_id,
-            }))?;
-        self.http.execute_empty(spec).await
-    }
-
-    pub async fn decline_fn_party_invite(
-        &self,
-        party_id: &LobbyId,
-        self_id: &AccountId,
-    ) -> Result<(), RustfnError> {
-        let url = format!(
-            "{}/parties/{}/invites/{}/decline",
-            self.endpoints.br_party.trim_end_matches('/'),
-            party_id.as_str(),
-            self_id.as_str(),
-        );
-        let spec = HttpRequestSpec::post(url)
-            .with_auth(AuthSessionSlot::Fortnite)
-            .with_route_key("POST party/Fortnite/parties/{id}/invites/{id}/decline")
-            .with_json(&json!({}))?;
-        self.http.execute_empty(spec).await
     }
 
     pub async fn confirm_fn_party_member(

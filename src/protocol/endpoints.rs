@@ -9,7 +9,6 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 use thiserror::Error;
-use zeroize::Zeroizing;
 
 /// Default Epic Account Services deployment identifier used by Fortnite.
 pub const EOS_EAS_DEPLOYMENT_ID: &str = "62a9473a2dca46b29ccf17577fcf42d7";
@@ -362,12 +361,10 @@ impl AuthClient {
         )
     }
 
-    /// Encodes `Basic <base64(client_id:secret)>` in zeroizing storage.
-    pub fn basic_auth_header(self) -> Zeroizing<String> {
-        let mut raw = Zeroizing::new(format!("{}:{}", self.client_id(), self.secret()));
-        let encoded = STANDARD.encode(raw.as_bytes());
-        raw.clear();
-        Zeroizing::new(format!("Basic {encoded}"))
+    /// Encodes `Basic <base64(client_id:secret)>`.
+    pub fn basic_auth_header(self) -> String {
+        let encoded = STANDARD.encode(format!("{}:{}", self.client_id(), self.secret()).as_bytes());
+        format!("Basic {encoded}")
     }
 
     /// Looks up a known client by either its canonical string name or OAuth `client_id`.

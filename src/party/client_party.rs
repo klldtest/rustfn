@@ -52,10 +52,11 @@ pub struct ReceivedPartyInvitation {
     pub sent_at: Option<String>,
     pub expires_at: Option<String>,
     pub meta: BTreeMap<String, String>,
-    pub(crate) http: Option<HTTP>,
+    pub(crate) http: Option<Arc<HTTP>>,
 }
 
 impl ReceivedPartyInvitation {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_stomp(
         eos_party_id: PartyId,
         inviter_id: AccountId,
@@ -74,7 +75,7 @@ impl ReceivedPartyInvitation {
             sent_at,
             expires_at,
             meta,
-            http: Some(http),
+            http: Some(Arc::new(http)),
         }
     }
 
@@ -103,7 +104,7 @@ pub struct ReceivedPartyJoinRequest {
     pub self_id: AccountId,
     pub sent_at: Option<String>,
     pub expires_at: Option<String>,
-    pub(crate) http: Option<HTTP>,
+    pub(crate) http: Option<Arc<HTTP>>,
 }
 
 impl ReceivedPartyJoinRequest {
@@ -121,7 +122,7 @@ impl ReceivedPartyJoinRequest {
             self_id,
             sent_at,
             expires_at,
-            http: Some(http),
+            http: Some(Arc::new(http)),
         }
     }
 
@@ -158,7 +159,7 @@ pub struct PendingMemberConfirmation {
     pub account_id: AccountId,
     pub account_display_name: Option<String>,
     pub sent_at: Option<String>,
-    pub(crate) http: Option<HTTP>,
+    pub(crate) http: Option<Arc<HTTP>>,
 }
 
 impl PendingMemberConfirmation {
@@ -174,7 +175,7 @@ impl PendingMemberConfirmation {
             account_id,
             account_display_name,
             sent_at,
-            http: Some(http),
+            http: Some(Arc::new(http)),
         }
     }
 
@@ -474,6 +475,7 @@ pub struct PartyState {
 }
 
 impl PartyState {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_joined_data(
         self_id: AccountId,
         self_puid: Option<&ProductUserId>,
@@ -598,7 +600,7 @@ impl PartyState {
         self.snapshot.meta.apply_patch(&patch);
 
         if let Some(raw_joinability) = &msg.party_privacy_type
-            && let Ok(parsed) = serde_json::from_str::<PartyJoinability>(&format!("\"{raw_joinability}\""))
+            && let Ok(parsed) = PartyJoinability::deserialize(Value::String(raw_joinability.clone()))
         {
             self.snapshot.config.joinability = parsed;
         }
@@ -1087,17 +1089,17 @@ impl ClientParty {
             }
         });
 
-        let keepalive_handle = spawn_eos_keep_alive(
-            init.http.clone(),
-            fn_id.clone(),
-            eos_id.clone(),
-            init.self_id.clone(),
-            init.party_config.eos_keep_alive_interval,
-            retry_hook.clone(),
-            Arc::clone(&init.events),
-            Arc::clone(&init.snapshot_slot),
-            party_cancel.child_token(),
-        );
+        let keepalive_handle = spawn_eos_keep_alive(KeepAliveParams {
+            http: init.http.clone(),
+            fn_id: fn_id.clone(),
+            eos_id: eos_id.clone(),
+            self_id: init.self_id.clone(),
+            period: init.party_config.eos_keep_alive_interval,
+            retry_hook: retry_hook.clone(),
+            events: Arc::clone(&init.events),
+            snapshot_slot: Arc::clone(&init.snapshot_slot),
+            cancel: party_cancel.child_token(),
+        });
 
         let mut party_task = PartyTask {
             state,
@@ -1375,7 +1377,7 @@ impl ClientParty {
     }
 }
 
-fn spawn_eos_keep_alive(
+struct KeepAliveParams {
     http: HTTP,
     fn_id: LobbyId,
     eos_id: PartyId,
@@ -1385,26 +1387,28 @@ fn spawn_eos_keep_alive(
     events: Arc<dyn PartyEventSink>,
     snapshot_slot: Arc<RwLock<Option<PartySnapshot>>>,
     cancel: CancellationToken,
-) -> JoinHandle<()> {
-    let period = period.max(std::time::Duration::from_millis(10));
+}
+
+fn spawn_eos_keep_alive(params: KeepAliveParams) -> JoinHandle<()> {
+    let period = params.period.max(std::time::Duration::from_millis(10));
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => break,
+                _ = params.cancel.cancelled() => break,
                 _ = interval.tick() => {
-                    if let Err(err) = http.keep_alive_eos_party(&eos_id, &self_id, Some(retry_hook.clone())).await {
-                        if cancel.is_cancelled() {
+                    if let Err(err) = params.http.keep_alive_eos_party(&params.eos_id, &params.self_id, Some(params.retry_hook.clone())).await {
+                        if params.cancel.is_cancelled() {
                             break;
                         }
-                        warn!(party_id = %eos_id, error = %err, "EOS party keep-alive tick failed");
+                        warn!(party_id = %params.eos_id, error = %err, "EOS party keep-alive tick failed");
                         if err.is_not_found() {
-                            *snapshot_slot.write().await = None;
-                            cancel.cancel();
-                            events.emit_party_event(PartyEvent::PartyLeft {
-                                party_id: fn_id,
-                                eos_party_id: eos_id,
+                            *params.snapshot_slot.write().await = None;
+                            params.cancel.cancel();
+                            params.events.emit_party_event(PartyEvent::PartyLeft {
+                                party_id: params.fn_id,
+                                eos_party_id: params.eos_id,
                             });
                             break;
                         }

@@ -117,6 +117,21 @@ impl UserManager {
             .then(|| entry.profile.clone())
     }
 
+    pub fn get_cached_by_display_name(&self, display_name: &str) -> Option<UserProfile> {
+        let ttl = self.config.user_ttl;
+        self.cache.iter().find_map(|entry| {
+            let cached = entry.value();
+            (!cached.is_partial
+                && cached.fetched_at.elapsed() < ttl
+                && cached
+                    .profile
+                    .display_name
+                    .as_deref()
+                    .is_some_and(|dn| dn.eq_ignore_ascii_case(display_name)))
+            .then(|| cached.profile.clone())
+        })
+    }
+
     /// Seeds partial `(account_id, display_name)` data without overwriting fresh full entries.
     pub fn upsert_partial(&self, account_id: &AccountId, display_name: Option<String>) {
         if let Some(mut entry) = self.cache.get_mut(account_id) {
@@ -141,10 +156,11 @@ impl UserManager {
         &self,
         display_name: &str,
     ) -> Result<UserProfile, RustfnError> {
+        if let Some(cached) = self.get_cached_by_display_name(display_name) {
+            return Ok(cached);
+        }
         let record = self.http.fetch_account_by_display_name(display_name).await?;
-        let profile = UserProfile::from_account_record(record);
-        self.insert_cached(profile.clone(), false);
-        Ok(profile)
+        Ok(self.cache_full(UserProfile::from_account_record(record)))
     }
 
     pub async fn fetch_by_query(&self, id_or_display_name: &str) -> Result<UserProfile, RustfnError> {
@@ -272,7 +288,9 @@ impl UserManager {
                 is_partial,
             },
         );
-        if self.cache.len() > self.config.max_users {
+        // Hysteresis avoids an O(n log n) eviction sort on every insert at capacity.
+        let slack = (self.config.max_users / 10).max(16);
+        if self.cache.len() > self.config.max_users.saturating_add(slack) {
             let _ = self.sweep_expired();
         }
     }

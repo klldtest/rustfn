@@ -9,10 +9,10 @@ pub use error::{
     EpicgamesAPIErrorData, INVALID_TOKEN_CODES, RustfnError, ValidationFailure, error_codes,
 };
 pub use enums::{
-    AuthSessionType, AwayStatus, ConversationType, FortnitePartyPrivacy, InvitePermission,
-    InviteRestriction, PartyDiscoverability, PartyJoinability, PartyPrivacyPreset, PartyType,
-    Platform, Playlist, PresenceOnlineType, PresencePermission, ReadyState, Region,
-    SignedMessageType, UserSearchMatchType, UserSearchPlatform, V2Input,
+    AwayStatus, ConversationType, FortnitePartyPrivacy, InvitePermission, InviteRestriction,
+    PartyDiscoverability, PartyJoinability, PartyPrivacyPreset, PartyType, Platform, Playlist,
+    PresenceOnlineType, PresencePermission, ReadyState, Region, UserSearchMatchType,
+    UserSearchPlatform, V2Input,
 };
 pub use meta::{
     EOSPartyConnectionData, EOSPartyData, EOSPartyDataConfig, EOSPartyInviteData,

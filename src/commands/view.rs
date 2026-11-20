@@ -75,10 +75,6 @@ impl StringView {
         self.buffer[self.index..].chars().next()
     }
 
-    pub fn undo(&mut self) {
-        self.index = self.previous;
-    }
-
     pub fn skip_ws(&mut self) -> bool {
         self.previous = self.index;
         let rest = &self.buffer[self.index..];
@@ -106,13 +102,6 @@ impl StringView {
         let rest = &self.buffer[self.index..];
         self.index = self.buffer.len();
         rest
-    }
-
-    pub fn get(&mut self) -> Option<char> {
-        self.previous = self.index;
-        let cur = self.current()?;
-        self.index += cur.len_utf8();
-        self.current()
     }
 
     pub fn get_word(&mut self) -> &str {

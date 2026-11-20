@@ -7,7 +7,6 @@ use std::fmt;
 pub enum CommandError {
     CommandNotFound(String),
     MissingRequiredArgument(String),
-    TooManyArguments,
     BadArgument(String),
     CheckFailure(String),
     PrivateMessageOnly,
@@ -36,7 +35,6 @@ impl fmt::Display for CommandError {
             Self::MissingRequiredArgument(arg) => {
                 write!(f, "{arg} is a required argument that is missing.")
             }
-            Self::TooManyArguments => write!(f, "Too many arguments passed to command."),
             Self::BadArgument(msg) => write!(f, "Bad argument: {msg}"),
             Self::CheckFailure(msg) => write!(f, "Check failed: {msg}"),
             Self::PrivateMessageOnly => {

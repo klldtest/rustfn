@@ -62,7 +62,7 @@ impl Default for ClientConfig {
             default_status: "In Lobby".to_owned(),
             default_online_type: PresenceOnlineType::Online,
             eos_deployment_id: EOS_EAS_DEPLOYMENT_ID.to_owned(),
-            product_version: "++Fortnite+Release-31.00-CL-37219843".to_owned(),
+            product_version: "++Fortnite+Release-43.10-CL-60118918".to_owned(),
             game_auth_client: AuthClient::FortniteAndroidGameClient,
             fetch_friends: true,
             create_party: true,

@@ -47,13 +47,15 @@ impl Default for XMPPConfig {
             keepalive_interval: Duration::from_secs(10),
             ping_timeout: Duration::from_secs(45),
             connection_timeout: Duration::from_secs(60),
-            max_connection_retries: 5,
+            max_connection_retries: 20,
             retry_delay: Duration::from_secs(5),
             metadata_ttl: DEFAULT_MEMBER_METADATA_TTL,
             event_channel_capacity: 512,
         }
     }
 }
+
+type InitialPresencePayload = Option<(Option<String>, Option<String>)>;
 
 /// Asynchronous XMPP-over-WebSocket manager with bounded reconnection (`< max_retries`),
 /// fresh bearer token acquisition via [`TokenProvider`], and buffered party delta storage.
@@ -67,7 +69,7 @@ pub struct XMPP {
     connected_tx: watch::Sender<bool>,
     connected_rx: watch::Receiver<bool>,
     cmd_tx: Mutex<Option<mpsc::Sender<XMPPCommand>>>,
-    initial_presence: Arc<Mutex<Option<(Option<String>, Option<String>)>>>,
+    initial_presence: Arc<Mutex<InitialPresencePayload>>,
     task_handle: Mutex<Option<JoinHandle<()>>>,
     cancel_token: Mutex<Option<CancellationToken>>,
 }
@@ -174,23 +176,18 @@ impl XMPP {
                             let _ = tx.send(Err(msg.clone()));
                             break;
                         }
-                        if retry_count < config.max_connection_retries {
-                            retry_count += 1;
-                            let _ = event_tx.send(Arc::new(XMPPEvent::Disconnected {
-                                will_reconnect: true,
-                                reason: msg,
-                            }));
-                            tokio::select! {
-                                _ = cancel.cancelled() => break,
-                                _ = tokio::time::sleep(config.retry_delay) => continue,
-                            }
-                        } else {
-                            let _ = event_tx.send(Arc::new(XMPPEvent::ReconnectExhausted {
-                                attempts: retry_count,
-                                last_error: msg,
-                            }));
+                        if !schedule_xmpp_reconnect(
+                            &mut retry_count,
+                            &config,
+                            &event_tx,
+                            &cancel,
+                            msg,
+                        )
+                        .await
+                        {
                             break;
                         }
+                        continue;
                     }
                 };
 
@@ -198,7 +195,7 @@ impl XMPP {
                 let mut first_tx_for_stream = first_ready_tx.take();
                 let mut established_this_attempt = false;
 
-                let params = XMPPSessionParams {
+                let params = SessionParams {
                     wss_url: &config.wss_url,
                     domain: &config.domain,
                     account_id: account_id.as_str(),
@@ -211,7 +208,7 @@ impl XMPP {
                 };
 
                 let event_tx_ref = &event_tx;
-                let outcome = run_xmpp_connection(
+                let outcome = run_connection(
                     params,
                     &mut cmd_rx,
                     &connected_tx,
@@ -233,7 +230,7 @@ impl XMPP {
                 }
 
                 match outcome {
-                    HandledConnectionOutcome::Clean(
+                    ConnectionExit::Clean(
                         StreamExitReason::Cancelled | StreamExitReason::ClientDisconnected,
                     ) => {
                         let _ = event_tx.send(Arc::new(XMPPEvent::Disconnected {
@@ -242,41 +239,31 @@ impl XMPP {
                         }));
                         break;
                     }
-                    HandledConnectionOutcome::Clean(StreamExitReason::ForcedReconnect) => {
+                    ConnectionExit::Clean(StreamExitReason::ForcedReconnect) => {
                         let _ = event_tx.send(Arc::new(XMPPEvent::Disconnected {
                             will_reconnect: true,
                             reason: "forced reconnect".to_owned(),
                         }));
                         continue;
                     }
-                    HandledConnectionOutcome::Clean(
-                        StreamExitReason::StreamClosed
-                        | StreamExitReason::AuthFailed
-                        | StreamExitReason::PingTimeout,
-                    ) => {
+                    ConnectionExit::Clean(StreamExitReason::StreamClosed) => {
                         if let Some(tx) = first_tx_for_stream.take() {
                             let _ = tx.send(Err("XMPP stream closed before establishment".to_owned()));
                             break;
                         }
-                        if retry_count < config.max_connection_retries {
-                            retry_count += 1;
-                            let _ = event_tx.send(Arc::new(XMPPEvent::Disconnected {
-                                will_reconnect: true,
-                                reason: "stream closed by peer".to_owned(),
-                            }));
-                            tokio::select! {
-                                _ = cancel.cancelled() => break,
-                                _ = tokio::time::sleep(config.retry_delay) => continue,
-                            }
-                        } else {
-                            let _ = event_tx.send(Arc::new(XMPPEvent::ReconnectExhausted {
-                                attempts: retry_count,
-                                last_error: "stream closed by peer".to_owned(),
-                            }));
+                        if !schedule_xmpp_reconnect(
+                            &mut retry_count,
+                            &config,
+                            &event_tx,
+                            &cancel,
+                            "stream closed by peer".to_owned(),
+                        )
+                        .await
+                        {
                             break;
                         }
                     }
-                    HandledConnectionOutcome::Error { reason, auth_failed } => {
+                    ConnectionExit::Error { reason, auth_failed } => {
                         if auth_failed {
                             let _ = token_provider
                                 .refresh_on_invalid_token(
@@ -289,34 +276,22 @@ impl XMPP {
                             let _ = tx.send(Err(reason));
                             break;
                         }
-                        if retry_count < config.max_connection_retries {
-                            retry_count += 1;
-                            info!(
-                                account_id = %account_id,
-                                retry = retry_count,
-                                max_retries = config.max_connection_retries,
-                                reason = %reason,
-                                "XMPP disconnected; scheduling reconnect"
-                            );
-                            let _ = event_tx.send(Arc::new(XMPPEvent::Disconnected {
-                                will_reconnect: true,
-                                reason,
-                            }));
-                            tokio::select! {
-                                _ = cancel.cancelled() => break,
-                                _ = tokio::time::sleep(config.retry_delay) => continue,
-                            }
-                        } else {
-                            warn!(
-                                account_id = %account_id,
-                                max_retries = config.max_connection_retries,
-                                reason = %reason,
-                                "XMPP reconnect retries exhausted"
-                            );
-                            let _ = event_tx.send(Arc::new(XMPPEvent::ReconnectExhausted {
-                                attempts: retry_count,
-                                last_error: reason,
-                            }));
+                        info!(
+                            account_id = %account_id,
+                            retry = retry_count + 1,
+                            max_retries = config.max_connection_retries,
+                            reason = %reason,
+                            "XMPP disconnected"
+                        );
+                        if !schedule_xmpp_reconnect(
+                            &mut retry_count,
+                            &config,
+                            &event_tx,
+                            &cancel,
+                            reason,
+                        )
+                        .await
+                        {
                             break;
                         }
                     }
@@ -433,9 +408,36 @@ pub enum StreamExitReason {
     Cancelled,
     ClientDisconnected,
     ForcedReconnect,
-    AuthFailed,
-    PingTimeout,
     StreamClosed,
+}
+
+async fn schedule_xmpp_reconnect(
+    retry_count: &mut u32,
+    config: &XMPPConfig,
+    event_tx: &broadcast::Sender<Arc<XMPPEvent>>,
+    cancel: &CancellationToken,
+    reason: String,
+) -> bool {
+    if *retry_count >= config.max_connection_retries {
+        let _ = event_tx.send(Arc::new(XMPPEvent::ReconnectExhausted {
+            attempts: *retry_count,
+            last_error: reason,
+        }));
+        return false;
+    }
+    *retry_count += 1;
+    let _ = event_tx.send(Arc::new(XMPPEvent::Disconnected {
+        will_reconnect: true,
+        reason,
+    }));
+    let delay = config
+        .retry_delay
+        .saturating_mul(1u32 << retry_count.saturating_sub(1).min(3))
+        .min(Duration::from_secs(30));
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,7 +450,7 @@ enum HandshakeStage {
     Established,
 }
 
-pub struct XMPPSessionParams<'a> {
+pub struct SessionParams<'a> {
     pub wss_url: &'a str,
     pub domain: &'a str,
     pub account_id: &'a str,
@@ -460,7 +462,7 @@ pub struct XMPPSessionParams<'a> {
     pub ping_timeout: Duration,
 }
 
-pub enum HandledConnectionOutcome {
+pub enum ConnectionExit {
     Clean(StreamExitReason),
     Error {
         reason: String,
@@ -470,17 +472,17 @@ pub enum HandledConnectionOutcome {
 
 /// Runs a single RFC 7395 XMPP-over-WebSocket connection from TLS/WS upgrade through
 /// handshake, keep-alive pinging, 45s pong watchdog, and inbound stanza dispatch.
-pub async fn run_xmpp_connection(
-    params: XMPPSessionParams<'_>,
+pub async fn run_connection(
+    params: SessionParams<'_>,
     cmd_rx: &mut tokio::sync::mpsc::Receiver<XMPPCommand>,
     on_established: &tokio::sync::watch::Sender<bool>,
     mut on_event: impl FnMut(XMPPEvent),
     cancel: &CancellationToken,
-) -> HandledConnectionOutcome {
+) -> ConnectionExit {
     let mut request = match params.wss_url.into_client_request() {
         Ok(req) => req,
         Err(err) => {
-            return HandledConnectionOutcome::Error {
+            return ConnectionExit::Error {
                 reason: format!("invalid XMPP WebSocket URL `{}`: {err}", params.wss_url),
                 auth_failed: false,
             };
@@ -493,7 +495,7 @@ pub async fn run_xmpp_connection(
     let auth_header = match HeaderValue::from_str(&format!("Bearer {}", params.access_token.expose_secret())) {
         Ok(val) => val,
         Err(err) => {
-            return HandledConnectionOutcome::Error {
+            return ConnectionExit::Error {
                 reason: format!("invalid XMPP Authorization header: {err}"),
                 auth_failed: true,
             };
@@ -506,19 +508,19 @@ pub async fn run_xmpp_connection(
         Ok(Err(tokio_tungstenite::tungstenite::Error::Http(resp))) => {
             let status = resp.status();
             let auth_failed = status.as_u16() == 401 || status.as_u16() == 403;
-            return HandledConnectionOutcome::Error {
+            return ConnectionExit::Error {
                 reason: format!("XMPP WebSocket HTTP upgrade rejected: {status}"),
                 auth_failed,
             };
         }
         Ok(Err(err)) => {
-            return HandledConnectionOutcome::Error {
+            return ConnectionExit::Error {
                 reason: format!("XMPP WebSocket connect error: {err}"),
                 auth_failed: false,
             };
         }
         Err(_) => {
-            return HandledConnectionOutcome::Error {
+            return ConnectionExit::Error {
                 reason: format!("XMPP connection timed out after {:?}", params.connection_timeout),
                 auth_failed: false,
             };
@@ -527,7 +529,7 @@ pub async fn run_xmpp_connection(
 
     let (mut sink, mut stream) = connect_res.split();
     if let Err(err) = sink.send(Message::text(open_frame(params.domain))).await {
-        return HandledConnectionOutcome::Error {
+        return ConnectionExit::Error {
             reason: format!("failed to send XMPP <open>: {err}"),
             auth_failed: false,
         };
@@ -546,6 +548,7 @@ pub async fn run_xmpp_connection(
 
     let handshake_deadline = Instant::now() + params.connection_timeout;
     let mut last_pong = Instant::now();
+    let mut bound_jid: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -555,11 +558,11 @@ pub async fn run_xmpp_connection(
                 let _ = sink.send(Message::text(close_frame())).await;
                 let _ = sink.close().await;
                 let _ = on_established.send(false);
-                return HandledConnectionOutcome::Clean(StreamExitReason::Cancelled);
+                return ConnectionExit::Clean(StreamExitReason::Cancelled);
             }
             _ = tokio::time::sleep_until(handshake_deadline), if stage != HandshakeStage::Established => {
                 let _ = sink.close().await;
-                return HandledConnectionOutcome::Error {
+                return ConnectionExit::Error {
                     reason: format!("XMPP handshake timed out in stage {stage:?}"),
                     auth_failed: false,
                 };
@@ -567,7 +570,7 @@ pub async fn run_xmpp_connection(
             _ = ping_ticker.tick(), if stage == HandshakeStage::Established => {
                 if let Err(err) = sink.send(Message::text(ping_iq_frame("ping"))).await {
                     let _ = on_established.send(false);
-                    return HandledConnectionOutcome::Error {
+                    return ConnectionExit::Error {
                         reason: format!("XMPP ping write failed: {err}"),
                         auth_failed: false,
                     };
@@ -578,7 +581,7 @@ pub async fn run_xmpp_connection(
                     warn!(account_id = params.account_id, "XMPP ping watchdog expired");
                     let _ = sink.close().await;
                     let _ = on_established.send(false);
-                    return HandledConnectionOutcome::Error {
+                    return ConnectionExit::Error {
                         reason: format!("XMPP ping timeout after {:?}", params.ping_timeout),
                         auth_failed: false,
                     };
@@ -589,7 +592,7 @@ pub async fn run_xmpp_connection(
                     Some(XMPPCommand::SendStanza(stanza)) => {
                         if let Err(err) = sink.send(Message::text(stanza)).await {
                             let _ = on_established.send(false);
-                            return HandledConnectionOutcome::Error {
+                            return ConnectionExit::Error {
                                 reason: format!("XMPP stanza write failed: {err}"),
                                 auth_failed: false,
                             };
@@ -599,7 +602,7 @@ pub async fn run_xmpp_connection(
                         let frame = chat_message_frame(&to_jid, &id, &body);
                         if let Err(err) = sink.send(Message::text(frame)).await {
                             let _ = on_established.send(false);
-                            return HandledConnectionOutcome::Error {
+                            return ConnectionExit::Error {
                                 reason: format!("XMPP chat write failed: {err}"),
                                 auth_failed: false,
                             };
@@ -609,7 +612,7 @@ pub async fn run_xmpp_connection(
                         let frame = presence_frame(status.as_deref(), show.as_deref(), unavailable);
                         if let Err(err) = sink.send(Message::text(frame)).await {
                             let _ = on_established.send(false);
-                            return HandledConnectionOutcome::Error {
+                            return ConnectionExit::Error {
                                 reason: format!("XMPP presence write failed: {err}"),
                                 auth_failed: false,
                             };
@@ -619,14 +622,14 @@ pub async fn run_xmpp_connection(
                         let _ = sink.send(Message::text(close_frame())).await;
                         let _ = sink.close().await;
                         let _ = on_established.send(false);
-                        return HandledConnectionOutcome::Clean(StreamExitReason::ForcedReconnect);
+                        return ConnectionExit::Clean(StreamExitReason::ForcedReconnect);
                     }
                     Some(XMPPCommand::Disconnect) | None => {
                         let _ = sink.send(Message::text(presence_frame(None, None, true))).await;
                         let _ = sink.send(Message::text(close_frame())).await;
                         let _ = sink.close().await;
                         let _ = on_established.send(false);
-                        return HandledConnectionOutcome::Clean(StreamExitReason::ClientDisconnected);
+                        return ConnectionExit::Clean(StreamExitReason::ClientDisconnected);
                     }
                 }
             }
@@ -635,14 +638,14 @@ pub async fn run_xmpp_connection(
                     Some(Ok(msg)) => msg,
                     Some(Err(err)) => {
                         let _ = on_established.send(false);
-                        return HandledConnectionOutcome::Error {
+                        return ConnectionExit::Error {
                             reason: format!("XMPP WebSocket read failed: {err}"),
                             auth_failed: false,
                         };
                     }
                     None => {
                         let _ = on_established.send(false);
-                        return HandledConnectionOutcome::Error {
+                        return ConnectionExit::Error {
                             reason: "XMPP WebSocket stream closed by remote host".to_owned(),
                             auth_failed: false,
                         };
@@ -653,13 +656,17 @@ pub async fn run_xmpp_connection(
                     Message::Text(text) => text.to_string(),
                     Message::Binary(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                     Message::Ping(payload) => {
+                        last_pong = Instant::now();
                         let _ = sink.send(Message::Pong(payload)).await;
                         continue;
                     }
-                    Message::Pong(_) => continue,
+                    Message::Pong(_) => {
+                        last_pong = Instant::now();
+                        continue;
+                    }
                     Message::Close(_) => {
                         let _ = on_established.send(false);
-                        return HandledConnectionOutcome::Clean(StreamExitReason::StreamClosed);
+                        return ConnectionExit::Clean(StreamExitReason::StreamClosed);
                     }
                     Message::Frame(_) => continue,
                 };
@@ -677,11 +684,11 @@ pub async fn run_xmpp_connection(
                 match (&mut stage, parsed) {
                     (_, XMPPIncomingStanza::Close) => {
                         let _ = on_established.send(false);
-                        return HandledConnectionOutcome::Clean(StreamExitReason::StreamClosed);
+                        return ConnectionExit::Clean(StreamExitReason::StreamClosed);
                     }
                     (_, XMPPIncomingStanza::StreamError { condition, text }) => {
                         let _ = on_established.send(false);
-                        return HandledConnectionOutcome::Error {
+                        return ConnectionExit::Error {
                             reason: format!(
                                 "XMPP stream:error ({}): {}",
                                 condition.unwrap_or_else(|| "unknown".to_owned()),
@@ -693,14 +700,14 @@ pub async fn run_xmpp_connection(
                     (HandshakeStage::AwaitAuthFeatures, XMPPIncomingStanza::Open { .. }) => {}
                     (HandshakeStage::AwaitAuthFeatures, XMPPIncomingStanza::StreamFeatures { mechanisms, .. }) => {
                         if !mechanisms.is_empty() && !mechanisms.iter().any(|m| m == "PLAIN") {
-                            return HandledConnectionOutcome::Error {
+                            return ConnectionExit::Error {
                                 reason: format!("server did not advertise SASL PLAIN ({mechanisms:?})"),
                                 auth_failed: true,
                             };
                         }
                         let sasl = sasl_plain_frame(params.account_id, params.access_token);
                         if let Err(err) = sink.send(Message::text(sasl)).await {
-                            return HandledConnectionOutcome::Error {
+                            return ConnectionExit::Error {
                                 reason: format!("failed to send SASL PLAIN stanza: {err}"),
                                 auth_failed: false,
                             };
@@ -709,7 +716,7 @@ pub async fn run_xmpp_connection(
                     }
                     (HandshakeStage::AwaitSaslOutcome, XMPPIncomingStanza::SaslSuccess) => {
                         if let Err(err) = sink.send(Message::text(open_frame(params.domain))).await {
-                            return HandledConnectionOutcome::Error {
+                            return ConnectionExit::Error {
                                 reason: format!("failed to send post-SASL <open>: {err}"),
                                 auth_failed: false,
                             };
@@ -717,7 +724,7 @@ pub async fn run_xmpp_connection(
                         stage = HandshakeStage::AwaitBindFeatures;
                     }
                     (HandshakeStage::AwaitSaslOutcome, XMPPIncomingStanza::SaslFailure { condition, text }) => {
-                        return HandledConnectionOutcome::Error {
+                        return ConnectionExit::Error {
                             reason: format!(
                                 "XMPP SASL authentication failed ({}): {}",
                                 condition.unwrap_or_else(|| "not-authorized".to_owned()),
@@ -733,7 +740,7 @@ pub async fn run_xmpp_connection(
                         }
                         let bind = bind_iq_frame("bind_1", params.resource);
                         if let Err(err) = sink.send(Message::text(bind)).await {
-                            return HandledConnectionOutcome::Error {
+                            return ConnectionExit::Error {
                                 reason: format!("failed to send bind IQ: {err}"),
                                 auth_failed: false,
                             };
@@ -744,18 +751,19 @@ pub async fn run_xmpp_connection(
                         if id.as_deref() == Some("bind_1") =>
                     {
                         if let Err(err) = sink.send(Message::text(session_iq_frame("sess_1"))).await {
-                            return HandledConnectionOutcome::Error {
+                            return ConnectionExit::Error {
                                 reason: format!("failed to send session IQ: {err}"),
                                 auth_failed: false,
                             };
                         }
-                        if let Some(ref bound_jid) = jid {
-                            debug!(account_id = params.account_id, jid = %bound_jid, "XMPP resource bound");
+                        if let Some(ref j) = jid {
+                            debug!(account_id = params.account_id, jid = %j, "XMPP resource bound");
                         }
+                        bound_jid = jid;
                         stage = HandshakeStage::AwaitSessionResult;
                     }
                     (HandshakeStage::AwaitBindResult | HandshakeStage::AwaitSessionResult, XMPPIncomingStanza::IqError { id, condition, text }) => {
-                        return HandledConnectionOutcome::Error {
+                        return ConnectionExit::Error {
                             reason: format!(
                                 "XMPP handshake IQ {:?} error ({}): {}",
                                 id,
@@ -778,7 +786,7 @@ pub async fn run_xmpp_connection(
                         stage = HandshakeStage::Established;
                         let _ = on_established.send(true);
                         on_event(XMPPEvent::Connected {
-                            jid,
+                            jid: bound_jid.take().or(jid),
                             resource: params.resource.to_owned(),
                         });
                     }
